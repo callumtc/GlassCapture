@@ -12,6 +12,9 @@
 @property (nonatomic, strong) AVAssetWriterInput *videoInput;
 @property (nonatomic, strong) AVAssetWriterInputPixelBufferAdaptor *adaptor;
 @property (nonatomic, strong, nullable) AVAssetWriterInput *audioInput;
+@property (nonatomic) VTPixelTransferSessionRef transferSession;
+@property (nonatomic) uint32_t width;
+@property (nonatomic) uint32_t height;
 @property (nonatomic) BOOL startedSession;
 @property (nonatomic) BOOL stopped;
 @property (nonatomic) int64_t basePtsNs;
@@ -20,6 +23,13 @@
 @end
 
 @implementation GcRecorder
+- (void)dealloc {
+    if (_transferSession) {
+        VTPixelTransferSessionInvalidate(_transferSession);
+        CFRelease(_transferSession);
+        _transferSession = NULL;
+    }
+}
 @end
 
 void *gc_recorder_start(const char *mov_path, uint32_t width, uint32_t height, double fps, bool with_audio) {
@@ -96,6 +106,11 @@ void *gc_recorder_start(const char *mov_path, uint32_t width, uint32_t height, d
         rec.videoInput = vIn;
         rec.adaptor = adaptor;
         rec.audioInput = aIn;
+        rec.width = width;
+        rec.height = height;
+        VTPixelTransferSessionRef xfer = NULL;
+        VTPixelTransferSessionCreate(kCFAllocatorDefault, &xfer);
+        rec.transferSession = xfer;
         rec.startedSession = NO;
         rec.stopped = NO;
         rec.basePtsNs = 0;
@@ -127,9 +142,27 @@ void gc_recorder_append_video(void *rec_ptr, void *cv_pixel_buffer, int64_t pts_
             }
             if (rec.videoInput.isReadyForMoreMediaData) {
                 CMTime t = CMTimeMake(relNs, 1000000000);
-                if ([rec.adaptor appendPixelBuffer:pb withPresentationTime:t]) {
+                CVPixelBufferRef toAppend = pb;
+                CVPixelBufferRef converted = NULL;
+
+                // Convert HDR (RGBA16Float/10-bit) or mismatched dimensions via hardware Media Engine into adaptor pool!
+                OSType fmt = CVPixelBufferGetPixelFormatType(pb);
+                size_t pw = CVPixelBufferGetWidth(pb);
+                size_t ph = CVPixelBufferGetHeight(pb);
+                if (fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || pw != rec.width || ph != rec.height) {
+                    CVPixelBufferPoolRef pool = rec.adaptor.pixelBufferPool;
+                    if (pool && rec.transferSession &&
+                        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &converted) == kCVReturnSuccess && converted) {
+                        if (VTPixelTransferSessionTransferImage(rec.transferSession, pb, converted) == noErr) {
+                            toAppend = converted;
+                        }
+                    }
+                }
+
+                if ([rec.adaptor appendPixelBuffer:toAppend withPresentationTime:t]) {
                     rec.lastVideoPtsNs = relNs;
                 }
+                if (converted) CVPixelBufferRelease(converted);
             }
             CVPixelBufferRelease(pb);
         }

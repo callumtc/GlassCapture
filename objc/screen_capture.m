@@ -45,6 +45,64 @@
 
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
     (void)stream;
+    if (type == SCStreamOutputTypeAudio) {
+        if (!_callbacks.on_audio_samples) return;
+        CMFormatDescriptionRef fmtDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
+        const AudioStreamBasicDescription *asbd = fmtDesc ? CMAudioFormatDescriptionGetStreamBasicDescription(fmtDesc) : NULL;
+        if (!asbd || asbd->mChannelsPerFrame == 0) return;
+
+        CMBlockBufferRef blockBuf = NULL;
+        AudioBufferList abl;
+        OSStatus st = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer, NULL, &abl, sizeof(abl), NULL, NULL,
+            kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &blockBuf
+        );
+        if (st != noErr || abl.mNumberBuffers == 0) {
+            if (blockBuf) CFRelease(blockBuf);
+            return;
+        }
+
+        uint32_t sr = (uint32_t)(asbd->mSampleRate > 0 ? asbd->mSampleRate : 48000);
+        bool isNonInterleaved = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+        uint32_t frames = 0;
+        float stereo[4096 * 2];
+        float peak = 0.0f;
+
+        if (isNonInterleaved && abl.mNumberBuffers >= 1) {
+            const float *lBuf = (const float *)abl.mBuffers[0].mData;
+            const float *rBuf = (abl.mNumberBuffers >= 2) ? (const float *)abl.mBuffers[1].mData : lBuf;
+            frames = abl.mBuffers[0].mDataByteSize / sizeof(float);
+            if (frames > 4096) frames = 4096;
+            for (uint32_t i = 0; i < frames; i++) {
+                float l = lBuf[i], r = rBuf[i];
+                stereo[i * 2] = l;
+                stereo[i * 2 + 1] = r;
+                float al = fabsf(l), ar = fabsf(r);
+                if (al > peak) peak = al;
+                if (ar > peak) peak = ar;
+            }
+        } else {
+            const float *src = (const float *)abl.mBuffers[0].mData;
+            uint32_t ch = asbd->mChannelsPerFrame;
+            frames = (abl.mBuffers[0].mDataByteSize / sizeof(float)) / ch;
+            if (frames > 4096) frames = 4096;
+            for (uint32_t i = 0; i < frames; i++) {
+                float l = src[i * ch];
+                float r = (ch >= 2) ? src[i * ch + 1] : l;
+                stereo[i * 2] = l;
+                stereo[i * 2 + 1] = r;
+                float al = fabsf(l), ar = fabsf(r);
+                if (al > peak) peak = al;
+                if (ar > peak) peak = ar;
+            }
+        }
+        if (frames > 0) {
+            _callbacks.on_audio_samples(_callbacks.ctx, stereo, frames, 2, sr, peak);
+        }
+        if (blockBuf) CFRelease(blockBuf);
+        return;
+    }
+
     if (type != SCStreamOutputTypeScreen) return;
 
     // Only accept complete newly-rendered frames (skip idle/blank WindowServer packets)
@@ -235,6 +293,10 @@ bool gc_screen_start_window(void *sc_ptr, uint32_t window_id, double target_fps,
         cfg.showsCursor = !hide_cursor;
         cfg.queueDepth = 3;
         cfg.scalesToFit = YES;
+        cfg.capturesAudio = YES;
+        cfg.excludesCurrentProcessAudio = YES;
+        cfg.sampleRate = 48000;
+        cfg.channelCount = 2;
         int32_t fpsInt = (target_fps >= 10.0 && target_fps <= 120.0) ? (int32_t)llround(target_fps) : 60;
         cfg.minimumFrameInterval = CMTimeMake(1, fpsInt);
 
@@ -244,6 +306,8 @@ bool gc_screen_start_window(void *sc_ptr, uint32_t window_id, double target_fps,
             NSLog(@"[GlassCapture] SCStream addStreamOutput failed: %@", addErr);
             return false;
         }
+        // Optional audio output for HEVC recording & meter
+        [stream addStreamOutput:sc type:SCStreamOutputTypeAudio sampleHandlerQueue:sc.sampleQueue error:nil];
 
         __block BOOL startedOk = NO;
         dispatch_semaphore_t startSem = dispatch_semaphore_create(0);

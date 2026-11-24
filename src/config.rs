@@ -17,6 +17,14 @@ pub struct AppConfig {
     pub audio_muted: bool,
     pub audio_volume: f32,
     pub sharpness: f32,
+    pub color_range_mode: i32,   // 0 = Auto, 1 = Limited, 2 = Full
+    pub contrast: f32,
+    pub saturation: f32,
+    pub gamma: f32,
+    pub overscan_crop: f32,
+    pub ab_split_enabled: bool,
+    pub ab_split_pos: f32,
+    pub scene_guard_enabled: bool,
     pub glass_style: i32,        // 0 = Regular, 1 = Clear
     pub preferred_overlay: i32,  // 1 = Match Window, 2 = Full Screen
 }
@@ -37,6 +45,14 @@ impl Default for AppConfig {
             audio_muted: false,
             audio_volume: 0.85,
             sharpness: 0.35,
+            color_range_mode: 0,
+            contrast: 1.0,
+            saturation: 1.0,
+            gamma: 1.0,
+            overscan_crop: 0.0,
+            ab_split_enabled: false,
+            ab_split_pos: 0.5,
+            scene_guard_enabled: true,
             glass_style: 0,
             preferred_overlay: GC_OVERLAY_MATCH_WINDOW,
         }
@@ -106,6 +122,32 @@ impl AppConfig {
                         cfg.sharpness = f.clamp(0.0, 1.0);
                     }
                 }
+                "color_range_mode" => {
+                    if let Ok(n) = val.parse() {
+                        cfg.color_range_mode = n;
+                    }
+                }
+                "contrast" => {
+                    if let Ok(f) = val.parse::<f32>() {
+                        cfg.contrast = f.clamp(0.7, 1.5);
+                    }
+                }
+                "saturation" => {
+                    if let Ok(f) = val.parse::<f32>() {
+                        cfg.saturation = f.clamp(0.0, 1.8);
+                    }
+                }
+                "gamma" => {
+                    if let Ok(f) = val.parse::<f32>() {
+                        cfg.gamma = f.clamp(0.6, 1.6);
+                    }
+                }
+                "overscan_crop" => {
+                    if let Ok(f) = val.parse::<f32>() {
+                        cfg.overscan_crop = f.clamp(0.0, 0.08);
+                    }
+                }
+                "scene_guard_enabled" => cfg.scene_guard_enabled = val == "true",
                 "glass_style" => {
                     if let Ok(n) = val.parse() {
                         cfg.glass_style = n;
@@ -142,6 +184,12 @@ impl AppConfig {
              audio_muted = {}\n\
              audio_volume = {:.3}\n\
              sharpness = {:.3}\n\
+             color_range_mode = {}\n\
+             contrast = {:.3}\n\
+             saturation = {:.3}\n\
+             gamma = {:.3}\n\
+             overscan_crop = {:.4}\n\
+             scene_guard_enabled = {}\n\
              glass_style = {}\n\
              preferred_overlay = {}\n",
             self.selected_video_uid,
@@ -157,6 +205,12 @@ impl AppConfig {
             self.audio_muted,
             self.audio_volume,
             self.sharpness,
+            self.color_range_mode,
+            self.contrast,
+            self.saturation,
+            self.gamma,
+            self.overscan_crop,
+            self.scene_guard_enabled,
             self.glass_style,
             self.preferred_overlay
         );
@@ -182,6 +236,14 @@ impl AppConfig {
             audio_muted: self.audio_muted,
             audio_volume: self.audio_volume,
             sharpness: self.sharpness,
+            color_range_mode: self.color_range_mode,
+            contrast: self.contrast,
+            saturation: self.saturation,
+            gamma: self.gamma,
+            overscan_crop: self.overscan_crop,
+            ab_split_enabled: self.ab_split_enabled,
+            ab_split_pos: self.ab_split_pos,
+            scene_guard_enabled: self.scene_guard_enabled,
             is_recording,
             is_paused,
             glass_style: self.glass_style,

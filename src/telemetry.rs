@@ -8,6 +8,7 @@ pub struct Telemetry {
     pub source_height: u32,
     pub output_width: u32,
     pub output_height: u32,
+    pub last_source_ms: f64,
     pub vt_proc_ms: f64,
     pub gpu_render_ms: f64,
     pub total_latency_ms: f64,
@@ -31,6 +32,7 @@ impl Telemetry {
             source_height: 0,
             output_width: 0,
             output_height: 0,
+            last_source_ms: 0.0,
             vt_proc_ms: 0.0,
             gpu_render_ms: 0.0,
             total_latency_ms: 0.0,
@@ -49,6 +51,7 @@ impl Telemetry {
     pub fn record_source_frame(&mut self, now_ms: f64, width: u32, height: u32) {
         self.source_width = width;
         self.source_height = height;
+        self.last_source_ms = now_ms;
         self.source_times.push_back(now_ms);
         trim_window(&mut self.source_times, now_ms);
     }
@@ -114,6 +117,7 @@ impl Telemetry {
         is_paused: bool,
         is_test_pattern: bool,
     ) -> GcHudMetrics {
+        let no_signal = !is_paused && (self.last_source_ms <= 0.0 || (now_ms - self.last_source_ms) > 2500.0);
         let mut m = GcHudMetrics {
             source_fps: self.source_fps(now_ms),
             output_fps: self.output_fps(now_ms),
@@ -130,6 +134,7 @@ impl Telemetry {
             recording_secs,
             is_paused,
             is_test_pattern,
+            no_signal,
             hdr_active: self.hdr_active,
             hdr_source_10bit: self.hdr_source_10bit,
             edr_headroom: self.edr_headroom,

@@ -64,6 +64,17 @@ typedef enum {
     GC_ACTION_SET_OVERLAY_STYLE   = 20, // int_arg = 1 (Match Window) or 2 (Full Screen)
     GC_ACTION_TOGGLE_HDR          = 21, // Toggle HDR / EDR passthrough
     GC_ACTION_TOGGLE_CLEAN_VIEW   = 22, // Toggle Clean / Zen View (hide all UI + HUD)
+    GC_ACTION_SET_COLOR_RANGE     = 23, // int_arg = 0 (Auto), 1 (Limited), 2 (Full)
+    GC_ACTION_SET_CONTRAST        = 24, // float_arg = 0.8..1.4
+    GC_ACTION_SET_SATURATION      = 25, // float_arg = 0.0..1.6
+    GC_ACTION_SET_GAMMA           = 26, // float_arg = 0.7..1.4
+    GC_ACTION_SET_OVERSCAN        = 27, // float_arg = 0.0..0.08
+    GC_ACTION_TOGGLE_AB_SPLIT     = 28, // Toggle split-screen A/B compare
+    GC_ACTION_SET_AB_SPLIT_POS    = 29, // float_arg = 0.05..0.95
+    GC_ACTION_RESET_COLOR         = 30, // Reset color & overscan to defaults
+    GC_ACTION_TOGGLE_SCENE_GUARD  = 31, // Toggle smart scene-cut & static-frame ANE guard
+    GC_ACTION_USE_TEST_SIGNAL     = 32, // Quick switch to built-in 1080p demo signal
+    GC_ACTION_OPEN_PRIVACY        = 33, // Open macOS Privacy & Security settings
     GC_ACTION_APP_WILL_TERMINATE  = 99,
 } GcUiAction;
 
@@ -90,11 +101,19 @@ typedef struct {
 // ============================================================================
 
 typedef struct {
-    int32_t upscale_mode;   // GcUpscaleMode
-    int32_t aspect_mode;    // GcAspectMode
+    int32_t upscale_mode;       // GcUpscaleMode
+    int32_t aspect_mode;        // GcAspectMode
     bool    integer_lock;
-    bool    hdr_enabled;    // Enable 10-bit/16-bit HDR/EDR passthrough
-    float   sharpness;      // 0.0..1.0
+    bool    hdr_enabled;        // Enable 10-bit/16-bit HDR/EDR passthrough
+    float   sharpness;          // 0.0..1.0
+    int32_t color_range_mode;   // 0=Auto, 1=Limited (16-235), 2=Full (0-255)
+    float   contrast;           // 0.8..1.4 (default 1.0)
+    float   saturation;         // 0.0..1.6 (default 1.0)
+    float   gamma;              // 0.7..1.4 (default 1.0)
+    float   overscan_crop;      // 0.0..0.08 (default 0.0)
+    bool    ab_split_enabled;   // Split-screen A/B compare (raw left vs enhanced right)
+    float   ab_split_pos;       // 0.05..0.95 (default 0.5)
+    float   window_edr_headroom;// Live EDR headroom of the window's actual NSScreen
 } GcRenderParams;
 
 typedef struct {
@@ -113,6 +132,7 @@ typedef struct {
     double   recording_secs;
     bool     is_paused;
     bool     is_test_pattern;
+    bool     no_signal;
     bool     hdr_active;
     bool     hdr_source_10bit;
     float    edr_headroom;
@@ -134,6 +154,14 @@ typedef struct {
     bool    audio_muted;
     float   audio_volume;
     float   sharpness;
+    int32_t color_range_mode;
+    float   contrast;
+    float   saturation;
+    float   gamma;
+    float   overscan_crop;
+    bool    ab_split_enabled;
+    float   ab_split_pos;
+    bool    scene_guard_enabled;
     bool    is_recording;
     bool    is_paused;
     int32_t glass_style;
@@ -197,6 +225,10 @@ void  gc_pixel_buffer_release(void *pb);
 uint32_t gc_pixel_buffer_width(void *pb);
 uint32_t gc_pixel_buffer_height(void *pb);
 double gc_monotonic_ms(void);
+// Computes fast 64-point mean absolute luma difference (0..255) in ~1.3us for scene-cut & static-frame detection.
+// Returns -1.0f if formats/dimensions differ or non-biplanar.
+float  gc_pixel_buffer_luma_diff(void *pb_a, void *pb_b);
+void   gc_format_local_timestamp(char *out_buf, size_t cap);
 
 // Creates an IOSurface-backed '420v' CVPixelBuffer filled with NV12 Y/CbCr data
 // Used by the Rust synthetic test-pattern generator.
@@ -229,7 +261,9 @@ void  gc_app_set_always_on_top(void *app, bool enabled);
 void  gc_app_toggle_fullscreen(void *app);
 void  gc_app_set_window_title(void *app, const char *title);
 bool  gc_app_is_visible(void *app);
+float gc_app_get_screen_edr_headroom(void *app);
 void  gc_app_set_overlay_mode(void *app, int32_t overlay_mode, uint32_t target_window_id, int32_t target_pid);
+void  gc_app_open_privacy_settings(void);
 
 // ============================================================================
 // ScreenCaptureKit Mac Game & App Window Capture (objc/screen_capture.m)

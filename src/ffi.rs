@@ -120,6 +120,17 @@ pub const GC_ACTION_TOGGLE_OVERLAY: i32 = 19;
 pub const GC_ACTION_SET_OVERLAY_STYLE: i32 = 20;
 pub const GC_ACTION_TOGGLE_HDR: i32 = 21;
 pub const GC_ACTION_TOGGLE_CLEAN_VIEW: i32 = 22;
+pub const GC_ACTION_SET_COLOR_RANGE: i32 = 23;
+pub const GC_ACTION_SET_CONTRAST: i32 = 24;
+pub const GC_ACTION_SET_SATURATION: i32 = 25;
+pub const GC_ACTION_SET_GAMMA: i32 = 26;
+pub const GC_ACTION_SET_OVERSCAN: i32 = 27;
+pub const GC_ACTION_TOGGLE_AB_SPLIT: i32 = 28;
+pub const GC_ACTION_SET_AB_SPLIT_POS: i32 = 29;
+pub const GC_ACTION_RESET_COLOR: i32 = 30;
+pub const GC_ACTION_TOGGLE_SCENE_GUARD: i32 = 31;
+pub const GC_ACTION_USE_TEST_SIGNAL: i32 = 32;
+pub const GC_ACTION_OPEN_PRIVACY: i32 = 33;
 pub const GC_ACTION_APP_WILL_TERMINATE: i32 = 99;
 
 #[repr(C)]
@@ -188,6 +199,14 @@ pub struct GcRenderParams {
     pub integer_lock: bool,
     pub hdr_enabled: bool,
     pub sharpness: f32,
+    pub color_range_mode: i32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub gamma: f32,
+    pub overscan_crop: f32,
+    pub ab_split_enabled: bool,
+    pub ab_split_pos: f32,
+    pub window_edr_headroom: f32,
 }
 
 #[repr(C)]
@@ -208,6 +227,7 @@ pub struct GcHudMetrics {
     pub recording_secs: f64,
     pub is_paused: bool,
     pub is_test_pattern: bool,
+    pub no_signal: bool,
     pub hdr_active: bool,
     pub hdr_source_10bit: bool,
     pub edr_headroom: f32,
@@ -235,6 +255,7 @@ impl Default for GcHudMetrics {
             recording_secs: 0.0,
             is_paused: false,
             is_test_pattern: false,
+            no_signal: false,
             hdr_active: false,
             hdr_source_10bit: false,
             edr_headroom: 1.0,
@@ -260,6 +281,14 @@ pub struct GcUiStateSnapshot {
     pub audio_muted: bool,
     pub audio_volume: f32,
     pub sharpness: f32,
+    pub color_range_mode: i32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub gamma: f32,
+    pub overscan_crop: f32,
+    pub ab_split_enabled: bool,
+    pub ab_split_pos: f32,
+    pub scene_guard_enabled: bool,
     pub is_recording: bool,
     pub is_paused: bool,
     pub glass_style: i32,
@@ -358,6 +387,8 @@ unsafe extern "C" {
     pub fn gc_pixel_buffer_width(pb: *mut c_void) -> u32;
     pub fn gc_pixel_buffer_height(pb: *mut c_void) -> u32;
     pub fn gc_monotonic_ms() -> f64;
+    pub fn gc_pixel_buffer_luma_diff(pb_a: *mut c_void, pb_b: *mut c_void) -> f32;
+    pub fn gc_format_local_timestamp(out_buf: *mut c_char, cap: usize);
     pub fn gc_create_nv12_pixel_buffer(
         width: u32,
         height: u32,
@@ -391,7 +422,9 @@ unsafe extern "C" {
     pub fn gc_app_toggle_fullscreen(app: *mut c_void);
     pub fn gc_app_set_window_title(app: *mut c_void, title: *const c_char);
     pub fn gc_app_is_visible(app: *mut c_void) -> bool;
+    pub fn gc_app_get_screen_edr_headroom(app: *mut c_void) -> f32;
     pub fn gc_app_set_overlay_mode(app: *mut c_void, overlay_mode: i32, target_window_id: u32, target_pid: i32);
+    pub fn gc_app_open_privacy_settings();
 
     pub fn gc_screen_create(callbacks: *const GcCallbacks) -> *mut c_void;
     pub fn gc_screen_destroy(sc: *mut c_void);

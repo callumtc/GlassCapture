@@ -446,6 +446,7 @@ static NSView *makeBadgeChip(NSTextField *label, NSColor *tint) {
 @property (nonatomic, strong) NSGlassEffectView *hudGlass;
 @property (nonatomic, strong) NSGlassEffectView *bottomDockGlass;
 @property (nonatomic, strong) NSGlassEffectView *inspectorGlass;
+@property (nonatomic, strong) NSGlassEffectView *noSignalGlass;
 @property (nonatomic, strong) NSGlassEffectView *toastGlass;
 
 // Top Source & Utility Controls
@@ -471,16 +472,36 @@ static NSView *makeBadgeChip(NSTextField *label, NSColor *tint) {
 @property (nonatomic, strong) GcAudioMeterView *audioMeter;
 @property (nonatomic, strong) GcPillButton *inspectorBtn;
 
-// Tuning Inspector Controls
+// Tuning Inspector Controls (3-Tab Glass Inspector)
+@property (nonatomic, strong) NSSegmentedControl *inspectorTabSeg;
+@property (nonatomic, strong) NSView *tabDisplayView;
+@property (nonatomic, strong) NSView *tabColorView;
+@property (nonatomic, strong) NSView *tabAudioView;
 @property (nonatomic, strong) NSSlider *sharpnessSlider;
 @property (nonatomic, strong) NSTextField *sharpnessValueLabel;
 @property (nonatomic, strong) NSSegmentedControl *aspectSeg;
+@property (nonatomic, strong) NSSlider *overscanSlider;
+@property (nonatomic, strong) NSTextField *overscanValueLabel;
 @property (nonatomic, strong) NSSwitch *intLockSwitch;
 @property (nonatomic, strong) NSSwitch *hdrSwitch;
 @property (nonatomic, strong) NSTextField *hdrHintLabel;
+
+// Color & A/B Tab Controls
+@property (nonatomic, strong) NSSegmentedControl *colorRangeSeg;
+@property (nonatomic, strong) NSSlider *contrastSlider;
+@property (nonatomic, strong) NSTextField *contrastValLabel;
+@property (nonatomic, strong) NSSlider *saturationSlider;
+@property (nonatomic, strong) NSTextField *saturationValLabel;
+@property (nonatomic, strong) NSSlider *gammaSlider;
+@property (nonatomic, strong) NSTextField *gammaValLabel;
+@property (nonatomic, strong) NSSwitch *abSplitSwitch;
+@property (nonatomic, strong) NSSlider *abSplitSlider;
+
+// Audio & Overlay Tab Controls
 @property (nonatomic, strong) NSPopUpButton *audioDevicePopup;
 @property (nonatomic, strong) NSSegmentedControl *glassStyleSeg;
 @property (nonatomic, strong) NSSegmentedControl *overlayStyleSeg;
+@property (nonatomic, strong) NSSwitch *sceneGuardSwitch;
 
 // Performance HUD Controls
 @property (nonatomic, strong) GcStatusDotView *hudDot;
@@ -514,14 +535,18 @@ static NSView *makeBadgeChip(NSTextField *label, NSColor *tint) {
 @property (nonatomic) BOOL cleanViewActive;
 @property (nonatomic) int32_t activeOverlayMode;
 @property (nonatomic) uint32_t overlayTargetWinId;
+@property (nonatomic) int32_t overlayTargetPid;
+@property (nonatomic) int overlayMissingTicks;
 @property (nonatomic) NSRect savedNormalFrame;
 @property (nonatomic) BOOL hasSavedNormalFrame;
 @property (nonatomic) GcUiStateSnapshot currentState;
 @property (nonatomic) BOOL suppressCallbacks;
 @property (nonatomic) _Atomic bool windowVisible;
+@property (nonatomic) _Atomic float screenEdrHeadroom;
 - (void)onToggleOverlay:(nullable id)sender;
 - (void)menuCycleFrameGen:(nullable id)sender;
 - (void)onToggleHud:(nullable id)sender;
+- (void)refreshScreenEdrHeadroom;
 @end
 
 static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef theEvent, void *userData) {
@@ -554,9 +579,37 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
         _chromeVisible = YES;
         _inspectorOpen = NO;
         atomic_store(&_windowVisible, true);
+        atomic_store(&_screenEdrHeadroom, 1.0f);
         [self buildApplicationAndWindow];
+        [self refreshScreenEdrHeadroom];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(onScreenParamsChanged:)
+                                                     name:NSApplicationDidChangeScreenParametersNotification
+                                                   object:nil];
     }
     return self;
+}
+
+- (void)refreshScreenEdrHeadroom {
+    NSScreen *scr = self.window.screen ?: NSScreen.mainScreen;
+    float hr = scr ? (float)scr.maximumExtendedDynamicRangeColorComponentValue : 1.0f;
+    if (hr < 1.0f) hr = 1.0f;
+    atomic_store_explicit(&_screenEdrHeadroom, hr, memory_order_relaxed);
+}
+
+- (void)onScreenParamsChanged:(NSNotification *)note {
+    (void)note;
+    [self refreshScreenEdrHeadroom];
+}
+
+- (void)setTrafficLightsVisible:(BOOL)visible {
+    NSWindowButton btns[3] = { NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton };
+    for (int i = 0; i < 3; i++) {
+        NSButton *b = [self.window standardWindowButton:btns[i]];
+        if (b) {
+            b.animator.alphaValue = visible ? 1.0 : 0.0;
+        }
+    }
 }
 
 - (void)emitAction:(GcUiAction)action intArg:(int32_t)i floatArg:(float)f strArg:(nullable NSString *)s {
@@ -725,6 +778,7 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
     [self buildPerformanceHudIn:overlayCanvas];
     [self buildBottomDockIn:overlayCanvas];
     [self buildInspectorCardIn:overlayCanvas];
+    [self buildNoSignalCardIn:overlayCanvas];
     [self buildToastIn:overlayCanvas];
     [self buildStatusBarMenu];
     [self registerGlobalHotKeys];
@@ -827,6 +881,10 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
     [row addArrangedSubview:_sourceDot];
 
     _videoDevicePopup = makeBorderlessPopup(140, 240, self, @selector(onVideoDeviceChanged:));
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onVideoPopupWillOpen:)
+                                                 name:NSPopUpButtonWillPopUpNotification
+                                               object:_videoDevicePopup];
     [row addArrangedSubview:_videoDevicePopup];
 
     [row addArrangedSubview:makeHairlineDivider(16.0)];
@@ -1093,82 +1151,220 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
     _inspectorGlass.hidden = YES;
     [parent addSubview:_inspectorGlass];
 
-    NSStackView *col = [[NSStackView alloc] init];
-    col.orientation = NSUserInterfaceLayoutOrientationVertical;
-    col.alignment = NSLayoutAttributeLeading;
-    col.spacing = 10.0;
-    col.edgeInsets = NSEdgeInsetsMake(14, 16, 12, 16);
-    col.translatesAutoresizingMaskIntoConstraints = NO;
+    NSStackView *outer = [[NSStackView alloc] init];
+    outer.orientation = NSUserInterfaceLayoutOrientationVertical;
+    outer.alignment = NSLayoutAttributeCenterX;
+    outer.spacing = 11.0;
+    outer.edgeInsets = NSEdgeInsetsMake(12, 16, 12, 16);
+    outer.translatesAutoresizingMaskIntoConstraints = NO;
 
-    // Header
-    NSTextField *title = makeLabel(@"Display, Audio & Liquid Glass", 12.5, NSFontWeightSemibold, NO, [NSColor whiteColor]);
-    [col addArrangedSubview:title];
+    // 3-Tab Header
+    _inspectorTabSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Display", @"Color & A/B", @"Audio & Overlay"]
+                                                         trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                               target:self
+                                                               action:@selector(onInspectorTabChanged:)];
+    _inspectorTabSeg.controlSize = NSControlSizeSmall;
+    _inspectorTabSeg.segmentStyle = NSSegmentStyleCapsule;
+    _inspectorTabSeg.selectedSegment = 0;
+    [outer addArrangedSubview:_inspectorTabSeg];
 
-    // Sharpness
+    // ---- TAB 0: Display & HDR ----
+    NSStackView *dispCol = [[NSStackView alloc] init];
+    dispCol.orientation = NSUserInterfaceLayoutOrientationVertical;
+    dispCol.alignment = NSLayoutAttributeLeading;
+    dispCol.spacing = 9.0;
+    dispCol.translatesAutoresizingMaskIntoConstraints = NO;
+
     _sharpnessSlider = [NSSlider sliderWithValue:0.35 minValue:0.0 maxValue:1.0 target:self action:@selector(onSharpnessChanged:)];
     _sharpnessSlider.controlSize = NSControlSizeSmall;
     _sharpnessSlider.translatesAutoresizingMaskIntoConstraints = NO;
-    [_sharpnessSlider.widthAnchor constraintEqualToConstant:170].active = YES;
+    [_sharpnessSlider.widthAnchor constraintEqualToConstant:168].active = YES;
     _sharpnessValueLabel = makeLabel(@"35%", 11.0, NSFontWeightMedium, YES, [NSColor secondaryLabelColor]);
-    [_sharpnessValueLabel.widthAnchor constraintEqualToConstant:34].active = YES;
-    [col addArrangedSubview:[self makeInspectorRowWithTitle:@"CAS Sharpness" control:_sharpnessSlider trailing:_sharpnessValueLabel]];
+    [_sharpnessValueLabel.widthAnchor constraintEqualToConstant:36].active = YES;
+    [dispCol addArrangedSubview:[self makeInspectorRowWithTitle:@"CAS Sharpness" control:_sharpnessSlider trailing:_sharpnessValueLabel]];
 
-    // Aspect Ratio
     _aspectSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Fit", @"Fill", @"16:9", @"4:3", @"Full"]
                                                    trackingMode:NSSegmentSwitchTrackingSelectOne
                                                          target:self
                                                          action:@selector(onAspectChanged:)];
     _aspectSeg.controlSize = NSControlSizeSmall;
     _aspectSeg.segmentStyle = NSSegmentStyleCapsule;
-    [col addArrangedSubview:[self makeInspectorRowWithTitle:@"Aspect Ratio" control:_aspectSeg trailing:nil]];
+    [dispCol addArrangedSubview:[self makeInspectorRowWithTitle:@"Aspect Ratio" control:_aspectSeg trailing:nil]];
 
-    // Integer 1:1 Scale Lock
+    _overscanSlider = [NSSlider sliderWithValue:0.0 minValue:0.0 maxValue:0.08 target:self action:@selector(onOverscanChanged:)];
+    _overscanSlider.controlSize = NSControlSizeSmall;
+    _overscanSlider.translatesAutoresizingMaskIntoConstraints = NO;
+    [_overscanSlider.widthAnchor constraintEqualToConstant:168].active = YES;
+    _overscanValueLabel = makeLabel(@"0%", 11.0, NSFontWeightMedium, YES, [NSColor secondaryLabelColor]);
+    [_overscanValueLabel.widthAnchor constraintEqualToConstant:36].active = YES;
+    [dispCol addArrangedSubview:[self makeInspectorRowWithTitle:@"Overscan Crop" control:_overscanSlider trailing:_overscanValueLabel]];
+
     _intLockSwitch = [[NSSwitch alloc] init];
     _intLockSwitch.controlSize = NSControlSizeSmall;
     _intLockSwitch.target = self;
     _intLockSwitch.action = @selector(onToggleIntLock:);
     NSTextField *intHint = makeLabel(@"Snap to crisp 1×/2×/3× pixels", 10.5, NSFontWeightRegular, NO, [NSColor secondaryLabelColor]);
-    [col addArrangedSubview:[self makeInspectorRowWithTitle:@"Integer Scale" control:_intLockSwitch trailing:intHint]];
+    [dispCol addArrangedSubview:[self makeInspectorRowWithTitle:@"Integer Scale" control:_intLockSwitch trailing:intHint]];
 
-    // HDR / EDR Passthrough
     _hdrSwitch = [[NSSwitch alloc] init];
     _hdrSwitch.controlSize = NSControlSizeSmall;
     _hdrSwitch.target = self;
     _hdrSwitch.action = @selector(onToggleHdr:);
     _hdrHintLabel = makeLabel(@"10-bit / XDR Extended Dynamic Range", 10.5, NSFontWeightRegular, NO, [NSColor secondaryLabelColor]);
-    [col addArrangedSubview:[self makeInspectorRowWithTitle:@"HDR Passthrough" control:_hdrSwitch trailing:_hdrHintLabel]];
+    [dispCol addArrangedSubview:[self makeInspectorRowWithTitle:@"HDR Passthrough" control:_hdrSwitch trailing:_hdrHintLabel]];
+    _tabDisplayView = dispCol;
 
-    // Audio Input Device
+    // ---- TAB 1: Color Grading & Split A/B Compare ----
+    NSStackView *colorCol = [[NSStackView alloc] init];
+    colorCol.orientation = NSUserInterfaceLayoutOrientationVertical;
+    colorCol.alignment = NSLayoutAttributeLeading;
+    colorCol.spacing = 9.0;
+    colorCol.translatesAutoresizingMaskIntoConstraints = NO;
+    colorCol.hidden = YES;
+
+    _colorRangeSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Auto", @"Limited", @"Full"]
+                                                       trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                             target:self
+                                                             action:@selector(onColorRangeChanged:)];
+    _colorRangeSeg.controlSize = NSControlSizeSmall;
+    _colorRangeSeg.segmentStyle = NSSegmentStyleCapsule;
+    [colorCol addArrangedSubview:[self makeInspectorRowWithTitle:@"Color Range" control:_colorRangeSeg trailing:nil]];
+
+    _contrastSlider = [NSSlider sliderWithValue:1.0 minValue:0.7 maxValue:1.5 target:self action:@selector(onContrastChanged:)];
+    _contrastSlider.controlSize = NSControlSizeSmall;
+    _contrastSlider.translatesAutoresizingMaskIntoConstraints = NO;
+    [_contrastSlider.widthAnchor constraintEqualToConstant:168].active = YES;
+    _contrastValLabel = makeLabel(@"100%", 11.0, NSFontWeightMedium, YES, [NSColor secondaryLabelColor]);
+    [_contrastValLabel.widthAnchor constraintEqualToConstant:38].active = YES;
+    [colorCol addArrangedSubview:[self makeInspectorRowWithTitle:@"Contrast" control:_contrastSlider trailing:_contrastValLabel]];
+
+    _saturationSlider = [NSSlider sliderWithValue:1.0 minValue:0.0 maxValue:1.8 target:self action:@selector(onSaturationChanged:)];
+    _saturationSlider.controlSize = NSControlSizeSmall;
+    _saturationSlider.translatesAutoresizingMaskIntoConstraints = NO;
+    [_saturationSlider.widthAnchor constraintEqualToConstant:168].active = YES;
+    _saturationValLabel = makeLabel(@"100%", 11.0, NSFontWeightMedium, YES, [NSColor secondaryLabelColor]);
+    [_saturationValLabel.widthAnchor constraintEqualToConstant:38].active = YES;
+    [colorCol addArrangedSubview:[self makeInspectorRowWithTitle:@"Saturation" control:_saturationSlider trailing:_saturationValLabel]];
+
+    _gammaSlider = [NSSlider sliderWithValue:1.0 minValue:0.6 maxValue:1.6 target:self action:@selector(onGammaChanged:)];
+    _gammaSlider.controlSize = NSControlSizeSmall;
+    _gammaSlider.translatesAutoresizingMaskIntoConstraints = NO;
+    [_gammaSlider.widthAnchor constraintEqualToConstant:168].active = YES;
+    _gammaValLabel = makeLabel(@"1.00", 11.0, NSFontWeightMedium, YES, [NSColor secondaryLabelColor]);
+    [_gammaValLabel.widthAnchor constraintEqualToConstant:38].active = YES;
+    [colorCol addArrangedSubview:[self makeInspectorRowWithTitle:@"Gamma" control:_gammaSlider trailing:_gammaValLabel]];
+
+    NSStackView *abRow = [[NSStackView alloc] init];
+    abRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    abRow.alignment = NSLayoutAttributeCenterY;
+    abRow.spacing = 8.0;
+    _abSplitSwitch = [[NSSwitch alloc] init];
+    _abSplitSwitch.controlSize = NSControlSizeSmall;
+    _abSplitSwitch.target = self;
+    _abSplitSwitch.action = @selector(onToggleAbSplit:);
+    _abSplitSlider = [NSSlider sliderWithValue:0.5 minValue:0.05 maxValue:0.95 target:self action:@selector(onAbSplitPosChanged:)];
+    _abSplitSlider.controlSize = NSControlSizeSmall;
+    _abSplitSlider.translatesAutoresizingMaskIntoConstraints = NO;
+    [_abSplitSlider.widthAnchor constraintEqualToConstant:112].active = YES;
+    NSButton *resetBtn = [NSButton buttonWithTitle:@"Reset" target:self action:@selector(onResetColor:)];
+    resetBtn.bezelStyle = NSBezelStyleAccessoryBarAction;
+    resetBtn.controlSize = NSControlSizeSmall;
+    [abRow addArrangedSubview:_abSplitSwitch];
+    [abRow addArrangedSubview:_abSplitSlider];
+    [abRow addArrangedSubview:resetBtn];
+    [colorCol addArrangedSubview:[self makeInspectorRowWithTitle:@"A/B Split (B)" control:abRow trailing:nil]];
+    _tabColorView = colorCol;
+
+    // ---- TAB 2: Audio, Overlay & Engine ----
+    NSStackView *audCol = [[NSStackView alloc] init];
+    audCol.orientation = NSUserInterfaceLayoutOrientationVertical;
+    audCol.alignment = NSLayoutAttributeLeading;
+    audCol.spacing = 9.0;
+    audCol.translatesAutoresizingMaskIntoConstraints = NO;
+    audCol.hidden = YES;
+
     _audioDevicePopup = makeBorderlessPopup(180, 225, self, @selector(onAudioDeviceChanged:));
-    [col addArrangedSubview:[self makeInspectorRowWithTitle:@"Audio Input" control:_audioDevicePopup trailing:nil]];
+    [audCol addArrangedSubview:[self makeInspectorRowWithTitle:@"Audio Input" control:_audioDevicePopup trailing:nil]];
 
-    // Overlay Mode Style (for Mac Games & Apps)
     _overlayStyleSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Match Window", @"Full Screen"]
                                                          trackingMode:NSSegmentSwitchTrackingSelectOne
                                                                target:self
                                                                action:@selector(onOverlayStyleChanged:)];
     _overlayStyleSeg.controlSize = NSControlSizeSmall;
     _overlayStyleSeg.segmentStyle = NSSegmentStyleCapsule;
-    [col addArrangedSubview:[self makeInspectorRowWithTitle:@"Game Overlay" control:_overlayStyleSeg trailing:nil]];
+    [audCol addArrangedSubview:[self makeInspectorRowWithTitle:@"Game Overlay" control:_overlayStyleSeg trailing:nil]];
 
-    // Liquid Glass Style
     _glassStyleSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"Regular Glass", @"Clear Glass"]
                                                        trackingMode:NSSegmentSwitchTrackingSelectOne
                                                              target:self
                                                              action:@selector(onGlassStyleSegChanged:)];
     _glassStyleSeg.controlSize = NSControlSizeSmall;
     _glassStyleSeg.segmentStyle = NSSegmentStyleCapsule;
-    [col addArrangedSubview:[self makeInspectorRowWithTitle:@"Glass Style" control:_glassStyleSeg trailing:nil]];
+    [audCol addArrangedSubview:[self makeInspectorRowWithTitle:@"Glass Style" control:_glassStyleSeg trailing:nil]];
 
-    // Shortcuts footer
-    NSTextField *keys = makeLabel(@"C Hide UI  ·  D HDR  ·  ⌘⇧O Overlay  ·  ⌘⇧G Frame Gen  ·  H HUD  ·  S Shot  ·  R Rec", 9.5, NSFontWeightRegular, NO, [NSColor colorWithWhite:0.65 alpha:0.85]);
-    [col addArrangedSubview:keys];
+    _sceneGuardSwitch = [[NSSwitch alloc] init];
+    _sceneGuardSwitch.controlSize = NSControlSizeSmall;
+    _sceneGuardSwitch.target = self;
+    _sceneGuardSwitch.action = @selector(onToggleSceneGuard:);
+    NSTextField *sgHint = makeLabel(@"Prevent cut morphing & save power on menus", 10.0, NSFontWeightRegular, NO, [NSColor secondaryLabelColor]);
+    [audCol addArrangedSubview:[self makeInspectorRowWithTitle:@"Scene Guard" control:_sceneGuardSwitch trailing:sgHint]];
+    _tabAudioView = audCol;
 
-    _inspectorGlass.contentView = col;
+    [outer addArrangedSubview:_tabDisplayView];
+    [outer addArrangedSubview:_tabColorView];
+    [outer addArrangedSubview:_tabAudioView];
+
+    NSTextField *keys = makeLabel(@"C Hide UI  ·  D HDR  ·  B A/B Split  ·  ⌘⇧O Overlay  ·  ⌘⇧G Frame Gen  ·  H HUD", 9.5, NSFontWeightRegular, NO, [NSColor colorWithWhite:0.65 alpha:0.85]);
+    [outer addArrangedSubview:keys];
+
+    _inspectorGlass.contentView = outer;
 
     [NSLayoutConstraint activateConstraints:@[
         [_inspectorGlass.centerXAnchor constraintEqualToAnchor:parent.centerXAnchor],
         [_inspectorGlass.bottomAnchor constraintEqualToAnchor:_bottomDockGlass.topAnchor constant:-12],
+    ]];
+}
+
+- (void)buildNoSignalCardIn:(NSView *)parent {
+    _noSignalGlass = makeGlassPill(22.0, YES);
+    _noSignalGlass.hidden = YES;
+    [parent addSubview:_noSignalGlass];
+
+    NSStackView *col = [[NSStackView alloc] init];
+    col.orientation = NSUserInterfaceLayoutOrientationVertical;
+    col.alignment = NSLayoutAttributeCenterX;
+    col.spacing = 8.0;
+    col.edgeInsets = NSEdgeInsetsMake(20, 26, 18, 26);
+    col.translatesAutoresizingMaskIntoConstraints = NO;
+
+    NSImageView *icon = [[NSImageView alloc] init];
+    icon.image = sfSymbol(@"video.slash", 28.0, NSFontWeightLight);
+    icon.contentTintColor = [NSColor colorWithWhite:0.85 alpha:0.80];
+    [col addArrangedSubview:icon];
+
+    NSTextField *title = makeLabel(@"Waiting for Video Signal", 14.5, NSFontWeightSemibold, NO, [NSColor whiteColor]);
+    NSTextField *sub = makeLabel(@"Check your capture card HDMI cable, or grant Camera / Screen Recording access.", 11.5, NSFontWeightRegular, NO, [NSColor secondaryLabelColor]);
+    [col addArrangedSubview:title];
+    [col addArrangedSubview:sub];
+
+    NSStackView *btns = [[NSStackView alloc] init];
+    btns.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    btns.spacing = 10.0;
+    NSButton *demoBtn = [NSButton buttonWithTitle:@"Switch to Demo Signal" target:self action:@selector(onUseTestSignal:)];
+    demoBtn.bezelStyle = NSBezelStyleRounded;
+    demoBtn.controlSize = NSControlSizeSmall;
+    NSButton *privBtn = [NSButton buttonWithTitle:@"Open Privacy Settings" target:self action:@selector(onOpenPrivacy:)];
+    privBtn.bezelStyle = NSBezelStyleRounded;
+    privBtn.controlSize = NSControlSizeSmall;
+    [btns addArrangedSubview:demoBtn];
+    [btns addArrangedSubview:privBtn];
+    [col addArrangedSubview:btns];
+
+    _noSignalGlass.contentView = col;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_noSignalGlass.centerXAnchor constraintEqualToAnchor:parent.centerXAnchor],
+        [_noSignalGlass.centerYAnchor constraintEqualToAnchor:parent.centerYAnchor],
     ]];
 }
 
@@ -1204,6 +1400,12 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
     }
     if (!self.chromeVisible) {
         self.chromeVisible = YES;
+        self.topSourceGlass.hidden = NO;
+        self.topUtilGlass.hidden = NO;
+        self.bottomDockGlass.hidden = NO;
+        if (self.currentState.hud_visible) {
+            self.hudGlass.hidden = NO;
+        }
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
             ctx.duration = 0.22;
             ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
@@ -1211,9 +1413,9 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
             self.topUtilGlass.animator.alphaValue = 1.0;
             self.bottomDockGlass.animator.alphaValue = 1.0;
             if (self.currentState.hud_visible) {
-                self.hudGlass.hidden = NO;
                 self.hudGlass.animator.alphaValue = 1.0;
             }
+            [self setTrafficLightsVisible:YES];
         }];
     }
     [self.hideTimer invalidate];
@@ -1237,8 +1439,9 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
     }
     self.chromeVisible = NO;
     BOOL hideHudToo = self.isFullScreen;
+    __weak typeof(self) weakSelf = self;
     [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
-        ctx.duration = 0.36;
+        ctx.duration = 0.34;
         ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
         self.topSourceGlass.animator.alphaValue = 0.0;
         self.topUtilGlass.animator.alphaValue = 0.0;
@@ -1246,8 +1449,16 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
         if (hideHudToo) {
             self.hudGlass.animator.alphaValue = 0.0;
         }
+        [self setTrafficLightsVisible:NO];
+    } completionHandler:^{
+        // Actually set hidden = YES so invisible glass pills NEVER steal clicks or double-click fullscreen!
+        if (!weakSelf.chromeVisible) {
+            weakSelf.topSourceGlass.hidden = YES;
+            weakSelf.topUtilGlass.hidden = YES;
+            weakSelf.bottomDockGlass.hidden = YES;
+            if (hideHudToo) weakSelf.hudGlass.hidden = YES;
+        }
     }];
-    // In Full Screen mode, also hide the macOS cursor cleanly until mouse moves!
     if (self.isFullScreen && self.window.isKeyWindow) {
         [NSCursor setHiddenUntilMouseMoves:YES];
     }
@@ -1322,6 +1533,7 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
     if ([chars isEqualToString:@"o"]) { [self onToggleOverlay:nil]; return YES; }
     if ([chars isEqualToString:@"d"]) { [self onToggleHdr:nil]; return YES; }
     if ([chars isEqualToString:@"c"]) { [self onToggleCleanView:nil]; return YES; }
+    if ([chars isEqualToString:@"b"]) { [self onToggleAbSplit:nil]; return YES; }
     if ([chars isEqualToString:@"i"]) { [self onToggleInspector:nil]; return YES; }
     if (event.keyCode == 53) { // Esc
         if (self.cleanViewActive) { [self onToggleCleanView:nil]; return YES; }
@@ -1387,6 +1599,52 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
     (void)sender;
     [self emitAction:GC_ACTION_SET_GLASS_STYLE intArg:(int32_t)self.glassStyleSeg.selectedSegment floatArg:0 strArg:nil];
 }
+- (void)onVideoPopupWillOpen:(NSNotification *)note {
+    (void)note;
+    // Live-refresh open Mac windows & capture cards silently right before the dropdown opens!
+    [self emitAction:GC_ACTION_REFRESH_DEVICES intArg:1 floatArg:0 strArg:nil];
+}
+
+- (void)onInspectorTabChanged:(id)sender {
+    (void)sender;
+    NSInteger sel = self.inspectorTabSeg.selectedSegment;
+    self.tabDisplayView.hidden = (sel != 0);
+    self.tabColorView.hidden = (sel != 1);
+    self.tabAudioView.hidden = (sel != 2);
+}
+
+- (void)onOverscanChanged:(id)sender {
+    (void)sender;
+    float v = self.overscanSlider.floatValue;
+    self.overscanValueLabel.stringValue = [NSString stringWithFormat:@"%.1f%%", v * 100.0f];
+    [self emitAction:GC_ACTION_SET_OVERSCAN intArg:0 floatArg:v strArg:nil];
+}
+- (void)onColorRangeChanged:(id)sender { (void)sender; [self emitAction:GC_ACTION_SET_COLOR_RANGE intArg:(int32_t)self.colorRangeSeg.selectedSegment floatArg:0 strArg:nil]; }
+- (void)onContrastChanged:(id)sender {
+    (void)sender;
+    float v = self.contrastSlider.floatValue;
+    self.contrastValLabel.stringValue = [NSString stringWithFormat:@"%.0f%%", v * 100.0f];
+    [self emitAction:GC_ACTION_SET_CONTRAST intArg:0 floatArg:v strArg:nil];
+}
+- (void)onSaturationChanged:(id)sender {
+    (void)sender;
+    float v = self.saturationSlider.floatValue;
+    self.saturationValLabel.stringValue = [NSString stringWithFormat:@"%.0f%%", v * 100.0f];
+    [self emitAction:GC_ACTION_SET_SATURATION intArg:0 floatArg:v strArg:nil];
+}
+- (void)onGammaChanged:(id)sender {
+    (void)sender;
+    float v = self.gammaSlider.floatValue;
+    self.gammaValLabel.stringValue = [NSString stringWithFormat:@"%.2f", v];
+    [self emitAction:GC_ACTION_SET_GAMMA intArg:0 floatArg:v strArg:nil];
+}
+- (void)onToggleAbSplit:(id)sender { (void)sender; [self emitAction:GC_ACTION_TOGGLE_AB_SPLIT intArg:0 floatArg:0 strArg:nil]; }
+- (void)onAbSplitPosChanged:(id)sender { (void)sender; [self emitAction:GC_ACTION_SET_AB_SPLIT_POS intArg:0 floatArg:self.abSplitSlider.floatValue strArg:nil]; }
+- (void)onResetColor:(id)sender { (void)sender; [self emitAction:GC_ACTION_RESET_COLOR intArg:0 floatArg:0 strArg:nil]; }
+- (void)onToggleSceneGuard:(id)sender { (void)sender; [self emitAction:GC_ACTION_TOGGLE_SCENE_GUARD intArg:0 floatArg:0 strArg:nil]; }
+- (void)onUseTestSignal:(id)sender { (void)sender; [self emitAction:GC_ACTION_USE_TEST_SIGNAL intArg:0 floatArg:0 strArg:nil]; }
+- (void)onOpenPrivacy:(id)sender { (void)sender; [self emitAction:GC_ACTION_OPEN_PRIVACY intArg:0 floatArg:0 strArg:nil]; }
+
 - (void)onToggleOverlay:(id)sender { (void)sender; [self emitAction:GC_ACTION_TOGGLE_OVERLAY intArg:0 floatArg:0 strArg:nil]; }
 - (void)onToggleHdr:(id)sender { (void)sender; [self emitAction:GC_ACTION_TOGGLE_HDR intArg:0 floatArg:0 strArg:nil]; }
 - (void)onToggleCleanView:(id)sender { (void)sender; [self emitAction:GC_ACTION_TOGGLE_CLEAN_VIEW intArg:0 floatArg:0 strArg:nil]; }
@@ -1467,6 +1725,15 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
     [self revealChromeAndScheduleAutoHide];
 }
 
+- (void)windowDidChangeScreen:(NSNotification *)notification {
+    (void)notification;
+    [self refreshScreenEdrHeadroom];
+}
+
+- (float)screenEdrHeadroomAtomic {
+    return atomic_load_explicit(&_screenEdrHeadroom, memory_order_relaxed);
+}
+
 - (bool)isWindowVisibleAtomic {
     return atomic_load_explicit(&_windowVisible, memory_order_relaxed);
 }
@@ -1478,6 +1745,7 @@ static OSStatus gcGlobalHotKeyHandler(EventHandlerCallRef nextHandler, EventRef 
     self.hudGlass.style = s;
     self.bottomDockGlass.style = s;
     self.inspectorGlass.style = s;
+    self.noSignalGlass.style = s;
     self.toastGlass.style = s;
 }
 
@@ -1605,6 +1873,18 @@ void gc_app_update_ui_state(void *app_ptr, const GcUiStateSnapshot *state_ptr) {
 
         ctrl.sharpnessSlider.floatValue = s.sharpness;
         ctrl.sharpnessValueLabel.stringValue = [NSString stringWithFormat:@"%.0f%%", s.sharpness * 100.0f];
+        ctrl.overscanSlider.floatValue = s.overscan_crop;
+        ctrl.overscanValueLabel.stringValue = [NSString stringWithFormat:@"%.1f%%", s.overscan_crop * 100.0f];
+        if (s.color_range_mode >= 0 && s.color_range_mode < 3) ctrl.colorRangeSeg.selectedSegment = s.color_range_mode;
+        ctrl.contrastSlider.floatValue = s.contrast;
+        ctrl.contrastValLabel.stringValue = [NSString stringWithFormat:@"%.0f%%", s.contrast * 100.0f];
+        ctrl.saturationSlider.floatValue = s.saturation;
+        ctrl.saturationValLabel.stringValue = [NSString stringWithFormat:@"%.0f%%", s.saturation * 100.0f];
+        ctrl.gammaSlider.floatValue = s.gamma;
+        ctrl.gammaValLabel.stringValue = [NSString stringWithFormat:@"%.2f", s.gamma];
+        ctrl.abSplitSwitch.state = s.ab_split_enabled ? NSControlStateValueOn : NSControlStateValueOff;
+        ctrl.abSplitSlider.floatValue = s.ab_split_pos;
+        ctrl.sceneGuardSwitch.state = s.scene_guard_enabled ? NSControlStateValueOn : NSControlStateValueOff;
         ctrl.volumeSlider.floatValue = s.audio_volume;
         ctrl.intLockSwitch.state = s.integer_lock ? NSControlStateValueOn : NSControlStateValueOff;
 
@@ -1617,12 +1897,21 @@ void gc_app_update_ui_state(void *app_ptr, const GcUiStateSnapshot *state_ptr) {
             [ctrl setInspectorOpen:NO animated:NO];
             [ctrl.hideTimer invalidate];
             ctrl.chromeVisible = NO;
+            __weak GcAppController *weakCtrl = ctrl;
             [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
                 ctx.duration = 0.25;
                 ctrl.topSourceGlass.animator.alphaValue = 0.0;
                 ctrl.topUtilGlass.animator.alphaValue = 0.0;
                 ctrl.bottomDockGlass.animator.alphaValue = 0.0;
                 ctrl.hudGlass.animator.alphaValue = 0.0;
+                [ctrl setTrafficLightsVisible:NO];
+            } completionHandler:^{
+                if (weakCtrl.cleanViewActive) {
+                    weakCtrl.topSourceGlass.hidden = YES;
+                    weakCtrl.topUtilGlass.hidden = YES;
+                    weakCtrl.bottomDockGlass.hidden = YES;
+                    weakCtrl.hudGlass.hidden = YES;
+                }
             }];
             if (ctrl.window.isKeyWindow) {
                 [NSCursor setHiddenUntilMouseMoves:YES];
@@ -1702,6 +1991,12 @@ void gc_app_update_hud_metrics(void *app_ptr, const GcHudMetrics *metrics_ptr) {
         if (ctrl.sourceDot.dotColor != dotColor) {
             ctrl.sourceDot.dotColor = dotColor;
             ctrl.hudDot.dotColor = dotColor;
+        }
+
+        // Show sleek No-Signal Liquid Glass card when no frames arrive for >2.5s (and not in game overlay)
+        BOOL showNoSignal = m.no_signal && (ctrl.activeOverlayMode == GC_OVERLAY_OFF) && !ctrl.cleanViewActive;
+        if (ctrl.noSignalGlass.hidden == showNoSignal) {
+            ctrl.noSignalGlass.hidden = !showNoSignal;
         }
 
         // Update HDR tags & headroom readout
@@ -1796,6 +2091,19 @@ bool gc_app_is_visible(void *app_ptr) {
     return [ctrl isWindowVisibleAtomic];
 }
 
+float gc_app_get_screen_edr_headroom(void *app_ptr) {
+    if (!app_ptr) return 1.0f;
+    GcAppController *ctrl = (__bridge GcAppController *)app_ptr;
+    return [ctrl screenEdrHeadroomAtomic];
+}
+
+void gc_app_open_privacy_settings(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"];
+        if (url) [[NSWorkspace sharedWorkspace] openURL:url];
+    });
+}
+
 void gc_app_set_overlay_mode(void *app_ptr, int32_t overlay_mode, uint32_t target_window_id, int32_t target_pid) {
     if (!app_ptr) return;
     GcAppController *ctrl = (__bridge GcAppController *)app_ptr;
@@ -1805,6 +2113,8 @@ void gc_app_set_overlay_mode(void *app_ptr, int32_t overlay_mode, uint32_t targe
         ctrl.overlayTrackTimer = nil;
         ctrl.activeOverlayMode = overlay_mode;
         ctrl.overlayTargetWinId = target_window_id;
+        ctrl.overlayTargetPid = target_pid;
+        ctrl.overlayMissingTicks = 0;
 
         if (overlay_mode == GC_OVERLAY_OFF) {
             ctrl.window.ignoresMouseEvents = NO;
@@ -1827,6 +2137,7 @@ void gc_app_set_overlay_mode(void *app_ptr, int32_t overlay_mode, uint32_t targe
             ctrl.topSourceGlass.hidden = NO;
             ctrl.topUtilGlass.hidden = NO;
             ctrl.bottomDockGlass.hidden = NO;
+            [ctrl setTrafficLightsVisible:YES];
             [ctrl revealChromeAndScheduleAutoHide];
             [ctrl.window makeKeyAndOrderFront:nil];
             [NSApp activateIgnoringOtherApps:YES];
@@ -1843,6 +2154,7 @@ void gc_app_set_overlay_mode(void *app_ptr, int32_t overlay_mode, uint32_t targe
         ctrl.topSourceGlass.hidden = YES;
         ctrl.topUtilGlass.hidden = YES;
         ctrl.bottomDockGlass.hidden = YES;
+        ctrl.noSignalGlass.hidden = YES;
 
         ctrl.window.styleMask = NSWindowStyleMaskBorderless;
         ctrl.window.hasShadow = NO;
@@ -1862,7 +2174,10 @@ void gc_app_set_overlay_mode(void *app_ptr, int32_t overlay_mode, uint32_t targe
             if (gc_screen_get_window_frame(target_window_id, &x, &y, &w, &h)) {
                 [ctrl.window setFrame:NSMakeRect(x, y, w, h) display:YES];
             }
-            // Track target game window's live position & size at 15 Hz
+            // Smart focus-aware window tracker (15 Hz):
+            // 1. Sticks pixel-for-pixel to target game window as it moves/resizes
+            // 2. Automatically hides when you Cmd+Tab to another app & restores when you Cmd+Tab back!
+            // 3. Auto-exits Overlay Mode if the target game window closes!
             __weak GcAppController *weakCtrl = ctrl;
             ctrl.overlayTrackTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 15.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
                 GcAppController *strong = weakCtrl;
@@ -1872,9 +2187,28 @@ void gc_app_set_overlay_mode(void *app_ptr, int32_t overlay_mode, uint32_t targe
                 }
                 double tx = 0, ty = 0, tw = 0, th = 0;
                 if (gc_screen_get_window_frame(strong.overlayTargetWinId, &tx, &ty, &tw, &th)) {
+                    strong.overlayMissingTicks = 0;
+                    if (strong.overlayTargetPid > 0) {
+                        pid_t frontPid = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+                        pid_t myPid = NSRunningApplication.currentApplication.processIdentifier;
+                        BOOL targetActive = (frontPid == (pid_t)strong.overlayTargetPid || frontPid == myPid);
+                        if (!targetActive) {
+                            if (strong.window.isVisible) [strong.window orderOut:nil];
+                            return;
+                        } else if (!strong.window.isVisible) {
+                            [strong.window orderFrontRegardless];
+                        }
+                    }
                     NSRect targetRect = NSMakeRect(tx, ty, tw, th);
                     if (!NSEqualRects(strong.window.frame, targetRect)) {
                         [strong.window setFrame:targetRect display:YES];
+                    }
+                } else {
+                    strong.overlayMissingTicks++;
+                    if (strong.overlayMissingTicks >= 10) {
+                        // Target game closed -> auto-exit overlay safely!
+                        [timer invalidate];
+                        [strong onToggleOverlay:nil];
                     }
                 }
             }];
@@ -1882,7 +2216,6 @@ void gc_app_set_overlay_mode(void *app_ptr, int32_t overlay_mode, uint32_t targe
 
         [ctrl.window orderFrontRegardless];
 
-        // Return focus immediately to the game/app underneath so keyboard & mouse work seamlessly!
         if (target_pid > 0) {
             NSRunningApplication *targetApp = [NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)target_pid];
             if (targetApp) {

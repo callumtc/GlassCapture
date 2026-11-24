@@ -47,6 +47,7 @@ Run hardware diagnostics from CLI:
 | `⌘⇧H` (Global) / `H` | Toggle floating Liquid Glass Performance HUD |
 | `C` | Clean View — Hide / Show all UI & HUD immediately |
 | `D` | Toggle HDR / EDR Passthrough |
+| `B` | Toggle Split-Screen A/B Compare (Raw vs Enhanced) |
 | `U` | Cycle Upscaler (`Off` → `MetalFX` → `Auto ML` → `CAS Sharp` → `Integer`) |
 | `I` | Toggle Liquid Glass Tuning Inspector |
 | `T` | Toggle Always on Top / Picture-in-Picture |

@@ -21,6 +21,10 @@ typedef struct {
     _Atomic float volume;
     _Atomic bool muted;
     _Atomic uint32_t sample_rate;
+    // Render-thread-only state for click-free gain & underrun smoothing
+    float smooth_gain;
+    float last_l;
+    float last_r;
 } GcAudioRing;
 
 static void gc_audio_ring_init(GcAudioRing *r) {
@@ -30,6 +34,9 @@ static void gc_audio_ring_init(GcAudioRing *r) {
     atomic_store(&r->volume, 0.85f);
     atomic_store(&r->muted, false);
     atomic_store(&r->sample_rate, 48000);
+    r->smooth_gain = 0.0f;
+    r->last_l = 0.0f;
+    r->last_r = 0.0f;
 }
 
 static void gc_audio_ring_push(GcAudioRing *r, const float *interleaved, uint32_t frames) {
@@ -92,8 +99,24 @@ static void gc_audio_ring_push(GcAudioRing *r, const float *interleaved, uint32_
                                                  selector:@selector(onDeviceNotification:)
                                                      name:AVCaptureDeviceWasDisconnectedNotification
                                                    object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(onAudioEngineConfigChanged:)
+                                                     name:AVAudioEngineConfigurationChangeNotification
+                                                   object:nil];
     }
     return self;
+}
+
+- (void)onAudioEngineConfigChanged:(NSNotification *)note {
+    (void)note;
+    // User plugged in AirPods / headphones or switched output speaker: seamlessly rebuild AVAudioEngine!
+    dispatch_async(_audioQueue, ^{
+        if (self.audioSession && self.audioSession.isRunning) {
+            self.audioEngineRunning = NO;
+            uint32_t sr = atomic_load_explicit(&self.audioRing->sample_rate, memory_order_relaxed);
+            [self ensureAudioPlaybackWithSampleRate:(double)(sr > 8000 ? sr : 48000)];
+        }
+    });
 }
 
 - (void)dealloc {
@@ -162,46 +185,68 @@ static void gc_audio_ring_push(GcAudioRing *r, const float *interleaved, uint32_
         uint64_t rd = atomic_load_explicit(&ring->read_idx, memory_order_relaxed);
         uint64_t avail = w - rd;
 
-        // Low-latency drift guard: if > ~50ms queued, skip forward to ~15ms
+        // Low-latency drift guard: if > ~50ms queued, skip forward to ~15ms with crossfade smoothing
+        bool jumped = false;
         if (avail > 2400) {
             rd = w - 720;
             avail = 720;
+            jumped = true;
         }
 
-        float vol = atomic_load_explicit(&ring->muted, memory_order_relaxed)
+        float targetGain = atomic_load_explicit(&ring->muted, memory_order_relaxed)
             ? 0.0f
             : atomic_load_explicit(&ring->volume, memory_order_relaxed);
 
-        if (avail == 0 || vol <= 0.0001f) {
+        float *leftOut = (outputData->mNumberBuffers >= 1) ? (float *)outputData->mBuffers[0].mData : NULL;
+        float *rightOut = (outputData->mNumberBuffers >= 2) ? (float *)outputData->mBuffers[1].mData : leftOut;
+
+        if (avail == 0 && ring->smooth_gain < 0.0005f && fabsf(ring->last_l) < 0.0005f && fabsf(ring->last_r) < 0.0005f) {
             for (UInt32 b = 0; b < outputData->mNumberBuffers; b++) {
                 memset(outputData->mBuffers[b].mData, 0, outputData->mBuffers[b].mDataByteSize);
-            }
-            if (avail > 0) {
-                uint64_t consume = avail < frameCount ? avail : frameCount;
-                atomic_store_explicit(&ring->read_idx, rd + consume, memory_order_release);
             }
             *isSilence = YES;
             return noErr;
         }
 
         *isSilence = NO;
-        float *leftOut = (outputData->mNumberBuffers >= 1) ? (float *)outputData->mBuffers[0].mData : NULL;
-        float *rightOut = (outputData->mNumberBuffers >= 2) ? (float *)outputData->mBuffers[1].mData : leftOut;
-
         uint32_t toRead = (avail < frameCount) ? (uint32_t)avail : frameCount;
+        float g = ring->smooth_gain;
+        float prevL = ring->last_l;
+        float prevR = ring->last_r;
+
         for (uint32_t i = 0; i < toRead; i++) {
+            // Smooth gain ramp (~5ms) prevents clicks on mute/volume drag
+            g += (targetGain - g) * 0.012f;
             uint64_t pos = ((rd + i) % GC_AUDIO_RING_FRAMES) * 2;
-            float l = ring->data[pos] * vol;
-            float r = ring->data[pos + 1] * vol;
+            float l = ring->data[pos] * g;
+            float r = ring->data[pos + 1] * g;
+            // 32-sample crossfade if drift guard jumped to eliminate pops
+            if (jumped && i < 32) {
+                float alpha = (float)(i + 1) / 32.0f;
+                l = prevL * (1.0f - alpha) + l * alpha;
+                r = prevR * (1.0f - alpha) + r * alpha;
+            }
             if (leftOut) leftOut[i] = l;
             if (rightOut && rightOut != leftOut) rightOut[i] = r;
-        }
-        for (uint32_t i = toRead; i < frameCount; i++) {
-            if (leftOut) leftOut[i] = 0.0f;
-            if (rightOut && rightOut != leftOut) rightOut[i] = 0.0f;
+            prevL = l;
+            prevR = r;
         }
 
-        atomic_store_explicit(&ring->read_idx, rd + toRead, memory_order_release);
+        // Exponential decay tail on brief underrun instead of hard step to 0 (prevents audible click!)
+        for (uint32_t i = toRead; i < frameCount; i++) {
+            prevL *= 0.85f;
+            prevR *= 0.85f;
+            if (leftOut) leftOut[i] = prevL;
+            if (rightOut && rightOut != leftOut) rightOut[i] = prevR;
+        }
+
+        ring->smooth_gain = g;
+        ring->last_l = prevL;
+        ring->last_r = prevR;
+
+        if (toRead > 0) {
+            atomic_store_explicit(&ring->read_idx, rd + toRead, memory_order_release);
+        }
         return noErr;
     }];
 

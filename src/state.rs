@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::ffi::*;
-use crate::pacer::FramePacer;
+use crate::pacer::{FramePacer, IngestOutcome, VtJobRequest};
 use crate::telemetry::Telemetry;
 use crate::test_pattern::{
     TEST_PATTERN_30_720P_UID, TEST_PATTERN_30_1080P_UID, TEST_PATTERN_60_1080P_UID,
@@ -11,7 +11,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SCREEN_PERM_PROMPT_UID: &str = "__GLASS_ENABLE_SCREEN_CAPTURE__";
 
@@ -63,6 +62,7 @@ pub struct AppController {
     is_recording_fast: AtomicBool,
     upscale_mode_fast: AtomicI32,
     framegen_mode_fast: AtomicI32,
+    scene_guard_fast: AtomicBool,
     last_hud_tick_ms_bits: AtomicU64,
     caps: GcHardwareCaps,
 }
@@ -75,6 +75,7 @@ impl AppController {
         }
         let up_fast = config.upscale_mode as i32;
         let fg_fast = config.framegen_mode as i32;
+        let sg_fast = config.scene_guard_enabled;
         let caps = query_hardware_caps();
         Arc::new(Self {
             handles: OnceLock::new(),
@@ -102,6 +103,7 @@ impl AppController {
             is_recording_fast: AtomicBool::new(false),
             upscale_mode_fast: AtomicI32::new(up_fast),
             framegen_mode_fast: AtomicI32::new(fg_fast),
+            scene_guard_fast: AtomicBool::new(sg_fast),
             last_hud_tick_ms_bits: AtomicU64::new(0),
             caps,
         })
@@ -117,7 +119,7 @@ impl AppController {
         };
         unsafe { gc_capture_request_permissions(h.capture) };
 
-        self.refresh_devices_and_auto_start();
+        self.refresh_devices(true);
 
         let (ui_snap, always_on_top) = {
             let st = self.state.lock().unwrap();
@@ -165,7 +167,7 @@ impl AppController {
         unsafe { gc_app_update_ui_state(h.app, &snap) };
     }
 
-    fn refresh_devices_and_auto_start(self: &Arc<Self>) {
+    fn refresh_devices(self: &Arc<Self>, force_restart: bool) {
         let mut raw_video = vec![GcDeviceInfo::default(); 32];
         let v_count = unsafe { gc_capture_list_video_devices(raw_video.as_mut_ptr(), 32) } as usize;
         raw_video.truncate(v_count);
@@ -189,7 +191,7 @@ impl AppController {
             ));
         }
 
-        // Append built-in synthetic test patterns for zero-hardware verification of Frame Gen & Upscaling!
+        // Append built-in synthetic test patterns
         raw_video.push(GcDeviceInfo::from_parts(
             TEST_PATTERN_30_1080P_UID,
             "Test Signal · 1080p 30fps (Frame Gen Demo)",
@@ -210,19 +212,18 @@ impl AppController {
         let a_count = unsafe { gc_capture_list_audio_devices(raw_audio.as_mut_ptr(), 32) } as usize;
         raw_audio.truncate(a_count);
 
-        let (chosen_video_uid, chosen_fmt_idx, chosen_audio_uid) = {
+        let (prev_video_uid, chosen_video_uid, chosen_fmt_idx, prev_audio_uid, chosen_audio_uid) = {
             let mut st = self.state.lock().unwrap();
+            let prev_v = st.config.selected_video_uid.clone();
+            let prev_a = st.config.selected_audio_uid.clone();
             st.video_devices = raw_video.clone();
             st.mac_windows = raw_windows;
             st.audio_devices = raw_audio.clone();
 
-            // Check if saved video UID is still present
             let saved_exists = !st.config.selected_video_uid.is_empty()
                 && raw_video.iter().any(|d| d.uid_str() == st.config.selected_video_uid);
 
             if !saved_exists {
-                // Prefer a real external capture card (excluding virtual cameras if a real hardware card is attached),
-                // otherwise default to our crisp 1080p 30fps Test Signal so the user sees immediate results!
                 let preferred_external = raw_video.iter().find(|d| {
                     d.is_external && !d.name_str().to_lowercase().contains("virtual")
                 });
@@ -235,7 +236,6 @@ impl AppController {
                 }
             }
 
-            // If saved audio UID is empty and an external capture card audio device exists, auto-select it
             let audio_exists = !st.config.selected_audio_uid.is_empty()
                 && raw_audio.iter().any(|d| d.uid_str() == st.config.selected_audio_uid);
             if !audio_exists {
@@ -247,14 +247,18 @@ impl AppController {
             }
 
             (
+                prev_v,
                 st.config.selected_video_uid.clone(),
                 st.config.selected_format_index,
+                prev_a,
                 st.config.selected_audio_uid.clone(),
             )
         };
 
-        self.start_video_source(&chosen_video_uid, chosen_fmt_idx);
-        if !chosen_audio_uid.is_empty() {
+        if force_restart || prev_video_uid != chosen_video_uid {
+            self.start_video_source(&chosen_video_uid, chosen_fmt_idx);
+        }
+        if (force_restart || prev_audio_uid != chosen_audio_uid) && !chosen_audio_uid.is_empty() {
             self.start_audio_source(&chosen_audio_uid);
         }
         self.sync_device_lists_to_ui();
@@ -487,8 +491,11 @@ impl AppController {
     // Hot-Path Video Pipeline (Capture -> VT Neural Frame Gen -> Display Link -> MetalFX)
     // ========================================================================
 
-    fn maybe_ml_upscale(&self, pb: PixelBuffer) -> (PixelBuffer, Option<String>) {
-        if self.upscale_mode_fast.load(Ordering::Relaxed) != GcUpscaleMode::AutoMl as i32
+    fn maybe_ml_upscale(&self, pb: PixelBuffer, fg_mode: GcFrameGenMode) -> (PixelBuffer, Option<String>) {
+        // When Frame Gen is active on <=720p, run Frame Gen natively at 720p (~3.6-10.8ms) and let MetalFX Spatial (0.6ms)
+        // upscale to Retina instead of blocking the capture thread on 2 sequential ANE passes!
+        if fg_mode != GcFrameGenMode::Off
+            || self.upscale_mode_fast.load(Ordering::Relaxed) != GcUpscaleMode::AutoMl as i32
             || !self.caps.llsr_supported
             || pb.width() > 1280
             || pb.height() > 1280
@@ -505,6 +512,41 @@ impl AppController {
             (sr_pb, Some(format!("VT ML {:.1}×", scale)))
         } else {
             (pb, None)
+        }
+    }
+
+    fn dispatch_vt_request(&self, req: VtJobRequest) {
+        let Some(h) = self.handles.get() else {
+            return;
+        };
+        let mut label_buf = [0 as c_char; 64];
+        let submitted = unsafe {
+            gc_vt_submit_frame_gen(
+                h.vt,
+                req.job_id,
+                req.prev_frame.as_ptr(),
+                req.curr_frame.as_ptr(),
+                req.multiplier,
+                false,
+                label_buf.as_mut_ptr(),
+                label_buf.len(),
+            )
+        };
+        if submitted {
+            let mut lbl = read_cstr(&label_buf);
+            if req.capped_to_120hz {
+                lbl = "VT Neural 2× (120Hz)".to_string();
+            }
+            if !lbl.is_empty() {
+                let mut tel = self.telemetry.lock().unwrap();
+                if tel.fg_engine != lbl {
+                    tel.fg_engine = lbl;
+                }
+            }
+        } else {
+            let mut pacer = self.pacer.lock().unwrap();
+            let _ = pacer.on_vt_complete(req.job_id, Vec::new(), -1, monotonic_ms(), false, |_, _| -1.0);
+            self.has_queued_frames.store(pacer.has_frames(), Ordering::Release);
         }
     }
 
@@ -531,6 +573,7 @@ impl AppController {
         }
 
         let fg_mode = GcFrameGenMode::from_i32(self.framegen_mode_fast.load(Ordering::Relaxed));
+        let scene_guard = self.scene_guard_fast.load(Ordering::Relaxed);
 
         {
             let mut tel = self.telemetry.lock().unwrap();
@@ -541,45 +584,48 @@ impl AppController {
             }
         }
 
-        // Run Neural Super-Resolution (<=720p) off the VSync thread right here on capture/worker thread!
-        let (work_pb, ml_prefix) = self.maybe_ml_upscale(pb);
+        let (work_pb, ml_prefix) = self.maybe_ml_upscale(pb, fg_mode);
 
-        let (job, has_any) = {
+        let (job, outcome, has_any) = {
             let mut pacer = self.pacer.lock().unwrap();
-            let req = pacer.ingest_real_frame(work_pb, pts_ns, arrival_ms, fg_mode, ml_prefix);
-            (req, pacer.has_frames())
+            let luma_diff = if scene_guard && fg_mode != GcFrameGenMode::Off {
+                match pacer.last_real_frame_ref() {
+                    Some(prev) => unsafe { gc_pixel_buffer_luma_diff(prev.as_ptr(), work_pb.as_ptr()) },
+                    None => -1.0,
+                }
+            } else {
+                -1.0
+            };
+            let (req, out) = pacer.ingest_real_frame(
+                work_pb,
+                pts_ns,
+                arrival_ms,
+                fg_mode,
+                ml_prefix,
+                scene_guard,
+                luma_diff,
+            );
+            (req, out, pacer.has_frames())
         };
         if has_any {
             self.has_queued_frames.store(true, Ordering::Release);
         }
 
-        if let Some(req) = job {
-            let mut label_buf = [0 as c_char; 64];
-            let submitted = unsafe {
-                gc_vt_submit_frame_gen(
-                    h.vt,
-                    req.job_id,
-                    req.prev_frame.as_ptr(),
-                    req.curr_frame.as_ptr(),
-                    req.multiplier,
-                    false,
-                    label_buf.as_mut_ptr(),
-                    label_buf.len(),
-                )
-            };
-            if submitted {
-                let lbl = read_cstr(&label_buf);
-                if !lbl.is_empty() {
-                    let mut tel = self.telemetry.lock().unwrap();
-                    if tel.fg_engine != lbl {
-                        tel.fg_engine = lbl;
-                    }
-                }
-            } else {
-                let mut pacer = self.pacer.lock().unwrap();
-                pacer.on_vt_frame(req.job_id, Vec::new(), 0, true, -1, monotonic_ms(), None);
-                self.has_queued_frames.store(pacer.has_frames(), Ordering::Release);
+        match outcome {
+            IngestOutcome::StaticSkippedAne => {
+                let mut tel = self.telemetry.lock().unwrap();
+                tel.fg_engine = "VT Neural (Idle)".to_string();
+                tel.vt_proc_ms = 0.0;
             }
+            IngestOutcome::SceneCutBypassed => {
+                let mut tel = self.telemetry.lock().unwrap();
+                tel.fg_engine = "VT Neural (Cut)".to_string();
+            }
+            _ => {}
+        }
+
+        if let Some(req) = job {
+            self.dispatch_vt_request(req);
         }
     }
 
@@ -587,8 +633,8 @@ impl AppController {
         &self,
         job_id: u64,
         out_buffers: Vec<PixelBuffer>,
-        frame_index: u32,
-        is_final: bool,
+        _frame_index: u32,
+        _is_final: bool,
         proc_ms: f64,
         status: i32,
     ) {
@@ -596,16 +642,27 @@ impl AppController {
             return;
         }
         let now_ms = monotonic_ms();
-        if status == 0 && is_final {
+        if status == 0 {
             self.telemetry.lock().unwrap().record_vt_proc(proc_ms);
         }
-        let has_any = {
+        let scene_guard = self.scene_guard_fast.load(Ordering::Relaxed);
+        let (chained_req, has_any) = {
             let mut pacer = self.pacer.lock().unwrap();
-            pacer.on_vt_frame(job_id, out_buffers, frame_index, is_final, status, now_ms, None);
-            pacer.has_frames()
+            let next = pacer.on_vt_complete(
+                job_id,
+                out_buffers,
+                status,
+                now_ms,
+                scene_guard,
+                |prev, curr| unsafe { gc_pixel_buffer_luma_diff(prev.as_ptr(), curr.as_ptr()) },
+            );
+            (next, pacer.has_frames())
         };
         if has_any {
             self.has_queued_frames.store(true, Ordering::Release);
+        }
+        if let Some(req) = chained_req {
+            self.dispatch_vt_request(req);
         }
     }
 
@@ -641,6 +698,7 @@ impl AppController {
         };
 
         if let Some(frame) = due {
+            let win_edr = unsafe { gc_app_get_screen_edr_headroom(h.app) };
             let render_params = {
                 let st = self.state.lock().unwrap();
                 GcRenderParams {
@@ -649,6 +707,14 @@ impl AppController {
                     integer_lock: st.config.integer_lock,
                     hdr_enabled: st.config.hdr_enabled,
                     sharpness: st.config.sharpness,
+                    color_range_mode: st.config.color_range_mode,
+                    contrast: st.config.contrast,
+                    saturation: st.config.saturation,
+                    gamma: st.config.gamma,
+                    overscan_crop: st.config.overscan_crop,
+                    ab_split_enabled: st.config.ab_split_enabled,
+                    ab_split_pos: st.config.ab_split_pos,
+                    window_edr_headroom: win_edr,
                 }
             };
 
@@ -890,8 +956,10 @@ impl AppController {
                 unsafe { gc_app_toggle_fullscreen(h.app) };
             }
             GC_ACTION_REFRESH_DEVICES => {
-                self.refresh_devices_and_auto_start();
-                self.toast("Refreshed capture devices");
+                self.refresh_devices(false);
+                if int_arg == 0 {
+                    self.toast("Refreshed capture devices & Mac windows");
+                }
             }
             GC_ACTION_SET_GLASS_STYLE => {
                 {
@@ -993,6 +1061,93 @@ impl AppController {
                     self.toast("Clean View — Press C or Esc to show UI");
                 }
             }
+            GC_ACTION_SET_COLOR_RANGE => {
+                let mode = int_arg.clamp(0, 2);
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.config.color_range_mode = mode;
+                    st.config.save();
+                }
+                self.push_ui_state();
+                self.toast(match mode {
+                    1 => "Color Range: Limited (16–235)",
+                    2 => "Color Range: Full (0–255)",
+                    _ => "Color Range: Auto",
+                });
+            }
+            GC_ACTION_SET_CONTRAST => {
+                let mut st = self.state.lock().unwrap();
+                st.config.contrast = float_arg.clamp(0.7, 1.5);
+                st.config.save();
+            }
+            GC_ACTION_SET_SATURATION => {
+                let mut st = self.state.lock().unwrap();
+                st.config.saturation = float_arg.clamp(0.0, 1.8);
+                st.config.save();
+            }
+            GC_ACTION_SET_GAMMA => {
+                let mut st = self.state.lock().unwrap();
+                st.config.gamma = float_arg.clamp(0.6, 1.6);
+                st.config.save();
+            }
+            GC_ACTION_SET_OVERSCAN => {
+                let mut st = self.state.lock().unwrap();
+                st.config.overscan_crop = float_arg.clamp(0.0, 0.08);
+                st.config.save();
+            }
+            GC_ACTION_TOGGLE_AB_SPLIT => {
+                let enabled = {
+                    let mut st = self.state.lock().unwrap();
+                    st.config.ab_split_enabled = !st.config.ab_split_enabled;
+                    st.config.ab_split_enabled
+                };
+                self.push_ui_state();
+                self.toast(if enabled {
+                    "Split Compare ON: Raw (Left) vs Enhanced (Right)"
+                } else {
+                    "Split Compare Off"
+                });
+            }
+            GC_ACTION_SET_AB_SPLIT_POS => {
+                let mut st = self.state.lock().unwrap();
+                st.config.ab_split_pos = float_arg.clamp(0.05, 0.95);
+            }
+            GC_ACTION_RESET_COLOR => {
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.config.color_range_mode = 0;
+                    st.config.contrast = 1.0;
+                    st.config.saturation = 1.0;
+                    st.config.gamma = 1.0;
+                    st.config.overscan_crop = 0.0;
+                    st.config.sharpness = 0.35;
+                    st.config.save();
+                }
+                self.push_ui_state();
+                self.toast("Color & Overscan Reset to Defaults");
+            }
+            GC_ACTION_TOGGLE_SCENE_GUARD => {
+                let enabled = {
+                    let mut st = self.state.lock().unwrap();
+                    st.config.scene_guard_enabled = !st.config.scene_guard_enabled;
+                    st.config.save();
+                    st.config.scene_guard_enabled
+                };
+                self.scene_guard_fast.store(enabled, Ordering::Relaxed);
+                self.push_ui_state();
+                self.toast(if enabled {
+                    "Smart Scene-Cut & Idle ANE Guard Enabled"
+                } else {
+                    "Scene-Cut Guard Disabled"
+                });
+            }
+            GC_ACTION_USE_TEST_SIGNAL => {
+                self.start_video_source(TEST_PATTERN_30_1080P_UID, 0);
+                self.toast("Switched to 1080p 30fps Demo Signal");
+            }
+            GC_ACTION_OPEN_PRIVACY => {
+                unsafe { gc_app_open_privacy_settings() };
+            }
             GC_ACTION_TAKE_SCREENSHOT => {
                 self.save_screenshot();
             }
@@ -1010,7 +1165,7 @@ impl AppController {
         if self.shutting_down.load(Ordering::Relaxed) {
             return;
         }
-        self.refresh_devices_and_auto_start();
+        self.refresh_devices(false);
     }
 
     fn save_screenshot(&self) {
@@ -1116,11 +1271,14 @@ fn user_media_dir(sub: &str) -> PathBuf {
 }
 
 fn unix_timestamp_label() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{}", secs)
+    let mut buf = [0 as c_char; 64];
+    unsafe { gc_format_local_timestamp(buf.as_mut_ptr(), buf.len()) };
+    let s = read_cstr(&buf);
+    if s.is_empty() {
+        "capture".to_string()
+    } else {
+        s
+    }
 }
 
 // ============================================================================

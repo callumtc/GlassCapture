@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
 #import <mach/mach_time.h>
+#import <time.h>
 
 // ============================================================================
 // PixelBuffer & Time Helpers
@@ -42,6 +43,64 @@ double gc_monotonic_ms(void) {
     }
     uint64_t t = mach_absolute_time();
     return ((double)t * (double)tb.numer / (double)tb.denom) / 1e6;
+}
+
+float gc_pixel_buffer_luma_diff(void *pb_a, void *pb_b) {
+    if (!pb_a || !pb_b) return -1.0f;
+    CVPixelBufferRef a = (CVPixelBufferRef)pb_a;
+    CVPixelBufferRef b = (CVPixelBufferRef)pb_b;
+    size_t wa = CVPixelBufferGetWidth(a), ha = CVPixelBufferGetHeight(a);
+    size_t wb = CVPixelBufferGetWidth(b), hb = CVPixelBufferGetHeight(b);
+    if (wa != wb || ha != hb || wa < 64 || ha < 64) return -1.0f;
+
+    OSType fa = CVPixelBufferGetPixelFormatType(a);
+    OSType fb = CVPixelBufferGetPixelFormatType(b);
+    BOOL is8a = (fa == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || fa == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+    BOOL is8b = (fb == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || fb == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+    if (!is8a || !is8b) return -1.0f;
+
+    if (CVPixelBufferLockBaseAddress(a, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return -1.0f;
+    if (CVPixelBufferLockBaseAddress(b, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        CVPixelBufferUnlockBaseAddress(a, kCVPixelBufferLock_ReadOnly);
+        return -1.0f;
+    }
+
+    const uint8_t *pa = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(a, 0);
+    const uint8_t *pb = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(b, 0);
+    size_t sa = CVPixelBufferGetBytesPerRowOfPlane(a, 0);
+    size_t sb = CVPixelBufferGetBytesPerRowOfPlane(b, 0);
+
+    float meanDiff = -1.0f;
+    if (pa && pb) {
+        int sum = 0;
+        size_t stepY = ha / 8;
+        size_t stepX = wa / 8;
+        size_t offY = stepY / 2;
+        size_t offX = stepX / 2;
+        for (int r = 0; r < 8; r++) {
+            size_t row = offY + (size_t)r * stepY;
+            const uint8_t *ra = pa + row * sa;
+            const uint8_t *rb = pb + row * sb;
+            for (int c = 0; c < 8; c++) {
+                size_t col = offX + (size_t)c * stepX;
+                int d = (int)ra[col] - (int)rb[col];
+                sum += (d < 0) ? -d : d;
+            }
+        }
+        meanDiff = (float)sum / 64.0f;
+    }
+
+    CVPixelBufferUnlockBaseAddress(b, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferUnlockBaseAddress(a, kCVPixelBufferLock_ReadOnly);
+    return meanDiff;
+}
+
+void gc_format_local_timestamp(char *out_buf, size_t cap) {
+    if (!out_buf || cap == 0) return;
+    time_t now = time(NULL);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    strftime(out_buf, cap, "%Y-%m-%d_%H-%M-%S", &lt);
 }
 
 void *gc_create_nv12_pixel_buffer(
@@ -184,16 +243,21 @@ void gc_hw_query_caps(GcHardwareCaps *out_caps) {
     }
 }
 
-- (void)computeFiTargetWidth:(uint32_t)srcW height:(uint32_t)srcH outW:(uint32_t *)outW outH:(uint32_t *)outH {
+- (void)computeFiTargetWidth:(uint32_t)srcW height:(uint32_t)srcH multiplier:(int32_t)multiplier outW:(uint32_t *)outW outH:(uint32_t *)outH {
     uint32_t w = srcW;
     uint32_t h = srcH;
-    // Clamp to hardware LLFI max dimension & pixel budget, keeping even dimensions for 420v
+    // Hardware-measured M3 Pro real-time budgets:
+    // - 2x LLFI at 1920x1080 = ~12ms (fits 60fps -> 120fps)
+    // - 4x LLFI at 1920x1080 = ~37ms (misses 30fps!), whereas 1280x720 = ~10.8ms (fits 30fps -> 120fps with 3x headroom!)
+    uint32_t maxDim = (multiplier >= 4) ? (uint32_t)MIN(_maxFiDim, 1280u) : _maxFiDim;
+    uint64_t maxPx  = (multiplier >= 4) ? MIN(_maxFiPixels, 1280ULL * 720ULL) : _maxFiPixels;
+
     double scale = 1.0;
-    if (w > _maxFiDim) scale = fmin(scale, (double)_maxFiDim / (double)w);
-    if (h > _maxFiDim) scale = fmin(scale, (double)_maxFiDim / (double)h);
+    if (w > maxDim) scale = fmin(scale, (double)maxDim / (double)w);
+    if (h > maxDim) scale = fmin(scale, (double)maxDim / (double)h);
     uint64_t px = (uint64_t)w * (uint64_t)h;
-    if (px > _maxFiPixels) {
-        scale = fmin(scale, sqrt((double)_maxFiPixels / (double)px));
+    if (px > maxPx) {
+        scale = fmin(scale, sqrt((double)maxPx / (double)px));
     }
     if (scale < 1.0) {
         w = ((uint32_t)floor((double)w * scale)) & ~1u;
@@ -392,12 +456,12 @@ bool gc_vt_submit_frame_gen(
     uint32_t srcW = (uint32_t)CVPixelBufferGetWidth(currRef);
     uint32_t srcH = (uint32_t)CVPixelBufferGetHeight(currRef);
     uint32_t targetW = 0, targetH = 0;
-    [vt computeFiTargetWidth:srcW height:srcH outW:&targetW outH:&targetH];
+    [vt computeFiTargetWidth:srcW height:srcH multiplier:multiplier outW:&targetW outH:&targetH];
 
     int32_t numInterp = (multiplier >= 4) ? 2 : 1;
     if (out_engine_label && label_cap > 0) {
         if (targetW < srcW || targetH < srcH) {
-            snprintf(out_engine_label, label_cap, "VT Neural %dx (%ux%u)", multiplier >= 4 ? 4 : 2, targetW, targetH);
+            snprintf(out_engine_label, label_cap, "VT Neural %dx (%up)", multiplier >= 4 ? 4 : 2, targetH);
         } else {
             snprintf(out_engine_label, label_cap, "VT Neural %dx", multiplier >= 4 ? 4 : 2);
         }
@@ -482,56 +546,27 @@ bool gc_vt_submit_frame_gen(
                 return;
             }
 
-            // Truly asynchronous non-blocking VT submission (no thread parked on semaphore!)
-            if (outCount > 1) {
-                // 4x mode: stream each interpolated frame (0.25, 0.5, 0.75) the instant ANE finishes it!
-                __block uint32_t seqIdx = 0;
-                [vt.fiProcessor processWithParameters:params frameOutputHandler:^(id<VTFrameProcessorParameters> p, CMTime pts, BOOL isFinal, NSError *e) {
-                    double elapsed = gc_monotonic_ms() - t0;
-                    if (e) {
-                        if (vt.callbacks.on_vt_result) {
-                            vt.callbacks.on_vt_result(vt.callbacks.ctx, job_id, NULL, 0, seqIdx, true, elapsed, (int32_t)e.code);
-                        }
-                        return;
-                    }
-                    VTLowLatencyFrameInterpolationParameters *fp = (VTLowLatencyFrameInterpolationParameters *)p;
-                    CVPixelBufferRef matched = NULL;
-                    uint32_t idx = seqIdx;
-                    for (NSUInteger k = 0; k < fp.destinationFrames.count; k++) {
-                        VTFrameProcessorFrame *df = fp.destinationFrames[k];
-                        if (CMTimeCompare(df.presentationTimeStamp, pts) == 0) {
-                            matched = df.buffer;
-                            idx = (uint32_t)k;
-                            break;
-                        }
-                    }
-                    if (!matched && seqIdx < fp.destinationFrames.count) {
-                        matched = fp.destinationFrames[seqIdx].buffer;
-                    }
-                    seqIdx++;
+            // Asynchronous completionHandler guarantees ALL destination frames ([0.5] or [0.25, 0.5, 0.75])
+            // are 100% finished and strictly ordered before delivery (zero out-of-order/reference glitches!).
+            [vt.fiProcessor processWithParameters:params completionHandler:^(id<VTFrameProcessorParameters> p, NSError *e) {
+                double elapsed = gc_monotonic_ms() - t0;
+                if (e) {
                     if (vt.callbacks.on_vt_result) {
-                        void *ptr = (void *)matched;
-                        vt.callbacks.on_vt_result(vt.callbacks.ctx, job_id, matched ? &ptr : NULL, matched ? 1 : 0, idx, isFinal, elapsed, 0);
+                        vt.callbacks.on_vt_result(vt.callbacks.ctx, job_id, NULL, 0, 0, true, elapsed, (int32_t)e.code);
                     }
-                }];
-            } else {
-                // 2x mode: single interpolated frame at 0.5
-                [vt.fiProcessor processWithParameters:params completionHandler:^(id<VTFrameProcessorParameters> p, NSError *e) {
-                    double elapsed = gc_monotonic_ms() - t0;
-                    if (e) {
-                        if (vt.callbacks.on_vt_result) {
-                            vt.callbacks.on_vt_result(vt.callbacks.ctx, job_id, NULL, 0, 0, true, elapsed, (int32_t)e.code);
-                        }
-                        return;
-                    }
-                    VTLowLatencyFrameInterpolationParameters *fp = (VTLowLatencyFrameInterpolationParameters *)p;
-                    CVPixelBufferRef buf = (fp.destinationFrames.count > 0) ? fp.destinationFrames[0].buffer : NULL;
-                    void *ptr = (void *)buf;
-                    if (vt.callbacks.on_vt_result) {
-                        vt.callbacks.on_vt_result(vt.callbacks.ctx, job_id, buf ? &ptr : NULL, buf ? 1 : 0, 0, true, elapsed, 0);
-                    }
-                }];
-            }
+                    return;
+                }
+                VTLowLatencyFrameInterpolationParameters *fp = (VTLowLatencyFrameInterpolationParameters *)p;
+                NSUInteger n = fp.destinationFrames.count;
+                if (n > 3) n = 3;
+                void *ptrs[3] = {NULL, NULL, NULL};
+                for (NSUInteger k = 0; k < n; k++) {
+                    ptrs[k] = (void *)fp.destinationFrames[k].buffer;
+                }
+                if (vt.callbacks.on_vt_result) {
+                    vt.callbacks.on_vt_result(vt.callbacks.ctx, job_id, ptrs, (uint32_t)n, 0, true, elapsed, 0);
+                }
+            }];
         }
     });
 

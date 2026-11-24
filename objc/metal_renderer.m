@@ -24,10 +24,14 @@ struct VertexOut {
 struct PresentUniforms {
     float2 scale;       // NDC scale for aspect ratio / integer lock
     float  sharpness;   // 0.0 .. 1.0 CAS sharpening strength
-    uint   flags;       // bit0: nearest, bit1: fullRange, bit2: CAS, bit3: hdrOut, bit4: inLinear, bit5: inPQ, bit6: inHLG
+    uint   flags;       // bit0: nearest, bit1: fullRange, bit2: CAS, bit3: hdrOut, bit4: inLinear, bit5: inPQ, bit6: inHLG, bit7: abSplit
     float2 texSize;     // source texture width, height
     float  edrHeadroom; // display EDR headroom (>= 1.0)
-    float  _pad;
+    float  overscan;    // 0.0 .. 0.08 edge crop fraction
+    float  contrast;    // 0.8 .. 1.4
+    float  saturation;  // 0.0 .. 1.6
+    float  gamma;       // 0.7 .. 1.4
+    float  abSplitPos;  // 0.05 .. 0.95 normalized X split
 };
 
 vertex VertexOut gc_quad_vs(uint vid [[vertex_id]], constant PresentUniforms &u [[buffer(0)]]) {
@@ -37,11 +41,13 @@ vertex VertexOut gc_quad_vs(uint vid [[vertex_id]], constant PresentUniforms &u 
         float2(-1.0,  1.0),
         float2( 1.0,  1.0)
     };
+    float lo = clamp(u.overscan, 0.0, 0.15);
+    float hi = 1.0 - lo;
     const float2 uvs[4] = {
-        float2(0.0, 1.0),
-        float2(1.0, 1.0),
-        float2(0.0, 0.0),
-        float2(1.0, 0.0)
+        float2(lo, hi),
+        float2(hi, hi),
+        float2(lo, lo),
+        float2(hi, lo)
     };
     VertexOut out;
     out.position = float4(pos[vid] * u.scale, 0.0, 1.0);
@@ -194,13 +200,46 @@ inline float3 apply_cas_rgb(texture2d<float> tex, sampler s, float2 uv, float2 i
     return (c + (n + so + w + e) * weight) / (1.0 + 4.0 * weight);
 }
 
+inline float3 apply_color_grade(float3 rgb, float contrast, float saturation, float gammaVal) {
+    float3 c = rgb;
+    if (abs(gammaVal - 1.0) > 0.005) {
+        c = sign(c) * pow(max(abs(c), 0.0), 1.0 / max(gammaVal, 0.2));
+    }
+    if (abs(contrast - 1.0) > 0.005) {
+        c = (c - 0.5) * contrast + 0.5;
+    }
+    if (abs(saturation - 1.0) > 0.005) {
+        float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
+        c = mix(float3(luma), c, saturation);
+    }
+    return c;
+}
+
 fragment float4 gc_present_rgba_fs(
     VertexOut in [[stage_in]],
     texture2d<float> colorTex [[texture(0)]],
+    texture2d<float> rawYTex  [[texture(1)]],
+    texture2d<float> rawUvTex [[texture(2)]],
     constant PresentUniforms &u [[buffer(0)]]
 ) {
     constexpr sampler sLinear(coord::normalized, filter::linear, address::clamp_to_edge);
     constexpr sampler sNearest(coord::normalized, filter::nearest, address::clamp_to_edge);
+
+    bool abSplit = (u.flags & 128u) != 0u;
+    if (abSplit) {
+        float dist = abs(in.uv.x - u.abSplitPos);
+        if (dist < 0.0018) {
+            return float4(0.85, 0.96, 1.0, 1.0);
+        }
+        if (in.uv.x < u.abSplitPos && !is_null_texture(rawYTex) && !is_null_texture(rawUvTex)) {
+            bool fullRange = (u.flags & 2u) != 0u;
+            float y = rawYTex.sample(sLinear, in.uv).r;
+            float2 cbcr = rawUvTex.sample(sLinear, in.uv).rg;
+            float3 rawRgb = ycbcr709_to_rgb(y, cbcr, fullRange);
+            bool hdrOut = (u.flags & 8u) != 0u;
+            return float4(hdrOut ? srgb_to_linear(rawRgb) : rawRgb, 1.0);
+        }
+    }
 
     float3 rgb;
     if ((u.flags & 1u) != 0u) {
@@ -211,6 +250,7 @@ fragment float4 gc_present_rgba_fs(
     } else {
         rgb = colorTex.sample(sLinear, in.uv).rgb;
     }
+    rgb = apply_color_grade(rgb, u.contrast, u.saturation, u.gamma);
     return float4(finalize_color_output(rgb, u.flags, u.edrHeadroom), 1.0);
 }
 
@@ -222,9 +262,15 @@ fragment float4 gc_present_nv12_fs(
 ) {
     constexpr sampler sLinear(coord::normalized, filter::linear, address::clamp_to_edge);
     constexpr sampler sNearest(coord::normalized, filter::nearest, address::clamp_to_edge);
-    bool nearest = (u.flags & 1u) != 0u;
+    bool abSplit = (u.flags & 128u) != 0u;
+    if (abSplit && abs(in.uv.x - u.abSplitPos) < 0.0018) {
+        return float4(0.85, 0.96, 1.0, 1.0);
+    }
+    bool leftRaw = abSplit && (in.uv.x < u.abSplitPos);
+
+    bool nearest = !leftRaw && ((u.flags & 1u) != 0u);
     bool fullRange = (u.flags & 2u) != 0u;
-    bool useCas = (u.flags & 4u) != 0u && u.sharpness > 0.01;
+    bool useCas = !leftRaw && ((u.flags & 4u) != 0u) && u.sharpness > 0.01;
     bool is2020 = ((u.flags & 32u) != 0u) || ((u.flags & 64u) != 0u);
 
     float y;
@@ -251,6 +297,11 @@ fragment float4 gc_present_nv12_fs(
     }
 
     float3 rgb = is2020 ? ycbcr2020_to_rgb(y, cbcr, fullRange) : ycbcr709_to_rgb(y, cbcr, fullRange);
+    if (leftRaw) {
+        bool hdrOut = (u.flags & 8u) != 0u;
+        return float4(hdrOut ? srgb_to_linear(rgb) : rgb, 1.0);
+    }
+    rgb = apply_color_grade(rgb, u.contrast, u.saturation, u.gamma);
     return float4(finalize_color_output(rgb, u.flags, u.edrHeadroom), 1.0);
 }
 )";
@@ -261,7 +312,11 @@ typedef struct {
     uint32_t    flags;
     simd_float2 texSize;
     float       edrHeadroom;
-    float       _pad;
+    float       overscan;
+    float       contrast;
+    float       saturation;
+    float       gamma;
+    float       abSplitPos;
 } PresentUniforms;
 
 typedef struct {
@@ -588,11 +643,15 @@ void gc_renderer_present(
         CAMetalLayer *layer = r.metalLayer;
         if (!layer || !r.commandQueue || !r.presentNv12SdrPSO || !r.presentRgbaSdrPSO) goto cleanup;
 
-        // Query live macOS display EDR headroom (e.g. 2.0-8.0 on Liquid Retina XDR, 1.0 on SDR monitor)
-        NSScreen *scr = NSScreen.mainScreen;
-        if (scr) {
-            headroom = (float)scr.maximumExtendedDynamicRangeColorComponentValue;
-            if (headroom < 1.0f) headroom = 1.0f;
+        // Use actual window's NSScreen EDR headroom (accurate on multi-monitor XDR + SDR setups!)
+        if (p.window_edr_headroom >= 1.0f) {
+            headroom = p.window_edr_headroom;
+        } else {
+            NSScreen *scr = NSScreen.mainScreen;
+            if (scr) {
+                headroom = (float)scr.maximumExtendedDynamicRangeColorComponentValue;
+                if (headroom < 1.0f) headroom = 1.0f;
+            }
         }
 
         BOOL wantHdr = p.hdr_enabled ? YES : NO;
@@ -618,8 +677,9 @@ void gc_renderer_present(
         BOOL isBiPlanar10 = (fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
                              fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange);
         BOOL isBiPlanar = isBiPlanar8 || isBiPlanar10;
-        BOOL fullRange = (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
-                          fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange);
+        BOOL autoFullRange = (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+                              fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange);
+        BOOL fullRange = (p.color_range_mode == 2) ? YES : ((p.color_range_mode == 1) ? NO : autoFullRange);
         BOOL isRgba16F = (fmt == kCVPixelFormatType_64RGBAHalf);
 
         // Inspect transfer function attachment for PQ / HLG / Linear HDR metadata
@@ -750,20 +810,27 @@ void gc_renderer_present(
         u.scale = ndcScale;
         u.sharpness = p.sharpness;
         u.edrHeadroom = headroom;
-        u._pad = 0.0f;
+        u.overscan = fmaxf(0.0f, fminf(0.10f, p.overscan_crop));
+        u.contrast = (p.contrast > 0.1f) ? p.contrast : 1.0f;
+        u.saturation = (p.saturation >= 0.0f) ? p.saturation : 1.0f;
+        u.gamma = (p.gamma > 0.1f) ? p.gamma : 1.0f;
+        u.abSplitPos = fmaxf(0.05f, fminf(0.95f, p.ab_split_pos > 0.01f ? p.ab_split_pos : 0.5f));
+        uint32_t abFlag = p.ab_split_enabled ? 128u : 0u;
 
         if (usedMetalFX) {
             // MetalFX output is already finalized into target SDR or Extended Linear HDR space!
-            u.flags = (wantHdr ? (8u | 16u) : 0u);
+            u.flags = (wantHdr ? (8u | 16u) : 0u) | abFlag | (fullRange ? 2u : 0u);
             if (p.sharpness > 0.05f) u.flags |= 4u;
             u.texSize = simd_make_float2((float)r.fxOutW, (float)r.fxOutH);
             [enc setRenderPipelineState:rgbaPSO];
             [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
             [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
             [enc setFragmentTexture:r.fxOutputTex atIndex:0];
+            [enc setFragmentTexture:(isBiPlanar ? yTex : nil) atIndex:1];
+            [enc setFragmentTexture:(isBiPlanar ? uvTex : nil) atIndex:2];
             [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         } else if (isBiPlanar && yTex && uvTex) {
-            u.flags = baseFlags;
+            u.flags = baseFlags | abFlag;
             if (p.upscale_mode == GC_UPSCALE_SHARP_CAS) u.flags |= 4u;
             u.texSize = simd_make_float2((float)srcW, (float)srcH);
             [enc setRenderPipelineState:nv12PSO];
@@ -773,13 +840,15 @@ void gc_renderer_present(
             [enc setFragmentTexture:uvTex atIndex:1];
             [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         } else if (rgbTex) {
-            u.flags = baseFlags;
+            u.flags = baseFlags | abFlag;
             if (p.upscale_mode == GC_UPSCALE_SHARP_CAS) u.flags |= 4u;
             u.texSize = simd_make_float2((float)srcW, (float)srcH);
             [enc setRenderPipelineState:rgbaPSO];
             [enc setVertexBytes:&u length:sizeof(u) atIndex:0];
             [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
             [enc setFragmentTexture:rgbTex atIndex:0];
+            [enc setFragmentTexture:nil atIndex:1];
+            [enc setFragmentTexture:nil atIndex:2];
             [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         }
 
