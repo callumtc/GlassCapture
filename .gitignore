@@ -1,0 +1,18 @@
+# Build artifacts
+/target/
+/dist/
+*.o
+*.a
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editor / IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
